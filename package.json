@@ -1,0 +1,55 @@
+{
+  "name": "xrom-apu",
+  "version": "0.1.0",
+  "description": "The NES sound chip (2A03 APU) in TypeScript: register writes in, samples out.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "keywords": [
+    "nes",
+    "famicom",
+    "apu",
+    "2a03",
+    "chiptune",
+    "synth",
+    "audio",
+    "emulator",
+    "ricoh"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DeepNESReverse/xrom-apu.git"
+  },
+  "homepage": "https://github.com/DeepNESReverse/xrom-apu#readme",
+  "bugs": {
+    "url": "https://github.com/DeepNESReverse/xrom-apu/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  },
+  "author": "Oleksandr Maksymov"
+}
