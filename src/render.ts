@@ -6,7 +6,7 @@
  * anything drawn over it — the playing position is one number both read.
  */
 
-import { Apu } from './chip.js';
+import { Apu, type ApuMemory, type ChannelBuffers } from './chip.js';
 import { mixApu, OutputFilters, PULSE_MIX, TRIANGLE_MIX } from './mixer.js';
 
 /** One CPU write to an APU register, at a moment in seconds from the start. */
@@ -34,7 +34,7 @@ export interface RenderOptions {
   /** Master level. Default 2.2 — the high-passes centre the signal and cost level. */
   gain?: number;
   /**
-   * A fader per channel, `[pulse1, pulse2, triangle, noise]`, 0..1. Default all 1.
+   * A fader per channel, `[pulse1, pulse2, triangle, noise, dmc]`, 0..1. Default all 1.
    *
    * Applied to each channel's level BEFORE the non-linear mixer, the only place
    * a per-channel level can go: the mixer's whole point is that the channels
@@ -49,6 +49,8 @@ export interface RenderOptions {
   consoleBass?: boolean;
   /** Honour the length counters. Default true. */
   lengthCounter?: boolean;
+  /** Cartridge memory the DMC reads its samples from — see `ApuMemory`. */
+  memory?: ApuMemory;
   /** Metronome clicks to mix in after the filters. */
   clicks?: readonly Click[];
   /** Seconds rendered past `duration` so the filters can ring out. Default 0.05. */
@@ -88,7 +90,7 @@ export function renderWrites(
     .map((write, index) => ({ at: Math.max(0, Math.round(write.time * rate)), index, write }))
     .sort((a, b) => a.at - b.at || a.index - b.index);
 
-  const chip = new Apu(rate, { lengthCounter: options.lengthCounter });
+  const chip = new Apu(rate, { lengthCounter: options.lengthCounter, memory: options.memory });
   const filters = new OutputFilters(rate, options.consoleBass ?? false);
   const out = new Float32Array(Math.ceil(total / oversample));
 
@@ -102,15 +104,20 @@ export function renderWrites(
   // loop mixes, filters and decimates it. A block ends early at the next write,
   // which has to land on its own sample.
   const BLOCK = 1024;
-  const p1 = new Uint8Array(BLOCK);
-  const p2 = new Uint8Array(BLOCK);
-  const tri = new Uint8Array(BLOCK);
-  const noise = new Float64Array(BLOCK);
+  const buffers: ChannelBuffers = {
+    pulse1: new Uint8Array(BLOCK),
+    pulse2: new Uint8Array(BLOCK),
+    triangle: new Uint8Array(BLOCK),
+    noise: new Float64Array(BLOCK),
+    dmc: new Uint8Array(BLOCK),
+  };
+  const { pulse1: p1, pulse2: p2, triangle: tri, noise, dmc } = buffers;
   const hasClicks = clicks.length > 0;
   const f0 = faders ? (faders[0] ?? 1) : 1;
   const f1 = faders ? (faders[1] ?? 1) : 1;
   const f2 = faders ? (faders[2] ?? 1) : 1;
   const f3 = faders ? (faders[3] ?? 1) : 1;
+  const f4 = faders ? (faders[4] ?? 1) : 1;
 
   let next = 0;
   let peak = 0;
@@ -125,17 +132,17 @@ export function renderWrites(
     }
     const until = next < ordered.length ? ordered[next].at : total;
     const count = Math.min(BLOCK, total - sample, until - sample);
-    chip.render(count, p1, p2, tri, noise, 0);
+    chip.render(count, buffers);
 
     for (let k = 0; k < count; k++, sample++) {
       let mixed: number;
       if (faders) {
-        mixed = mixApu(p1[k] * f0, p2[k] * f1, tri[k] * f2, noise[k] * f3);
-      } else if (noise[k] === 0) {
+        mixed = mixApu(p1[k] * f0, p2[k] * f1, tri[k] * f2, noise[k] * f3, dmc[k] * f4);
+      } else if (noise[k] === 0 && dmc[k] === 0) {
         // The common case, from tables built with the mixer's own expressions.
         mixed = PULSE_MIX[p1[k] + p2[k]] + TRIANGLE_MIX[tri[k]];
       } else {
-        const tnd = tri[k] / 8227 + noise[k] / 12241;
+        const tnd = tri[k] / 8227 + noise[k] / 12241 + dmc[k] / 22638;
         mixed = PULSE_MIX[p1[k] + p2[k]] + (tnd === 0 ? 0 : 159.79 / (1 / tnd + 100));
       }
       // Filtered at the oversampled rate: the low-pass then doubles as the

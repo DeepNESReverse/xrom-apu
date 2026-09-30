@@ -7,13 +7,20 @@
  * noise beside it. Getting this wrong is what makes a naive NES synth sound thin
  * and shrill.
  *
- * Inputs are each channel's 4-bit output level (0..15); the result is 0..~1 and
- * never negative. Centring it on zero is the output filters' job.
+ * Inputs are each channel's output level — 0..15, and 0..127 for the DMC; the
+ * result is 0..~1 and never negative. With the DMC at 0 its term adds exactly
+ * nothing, so a mix without it is bit for bit the four-channel one. Centring it on zero is the output filters' job.
  */
-export function mixApu(pulse1: number, pulse2: number, triangle: number, noise: number): number {
+export function mixApu(
+  pulse1: number,
+  pulse2: number,
+  triangle: number,
+  noise: number,
+  dmc = 0
+): number {
   const pulseSum = pulse1 + pulse2;
   const pulseOut = pulseSum === 0 ? 0 : 95.88 / (8128 / pulseSum + 100);
-  const tnd = triangle / 8227 + noise / 12241;
+  const tnd = triangle / 8227 + noise / 12241 + dmc / 22638;
   const tndOut = tnd === 0 ? 0 : 159.79 / (1 / tnd + 100);
   return pulseOut + tndOut;
 }

@@ -14,6 +14,7 @@
 
 export {
   CPU_HZ,
+  DMC_PERIODS,
   DUTY_SEQUENCES,
   FRAME_HZ,
   LENGTH_TABLE,
@@ -21,7 +22,13 @@ export {
   QUARTER_FRAME_HZ,
   TRIANGLE_STEPS,
 } from './constants.js';
-export { Apu, type ApuChipOptions, type ApuSnapshot } from './chip.js';
+export {
+  Apu,
+  type ApuChipOptions,
+  type ApuMemory,
+  type ApuSnapshot,
+  type ChannelBuffers,
+} from './chip.js';
 export { mixApu, OutputFilters } from './mixer.js';
 export {
   SWEEP_HZ,

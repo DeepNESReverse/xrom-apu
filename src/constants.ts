@@ -56,3 +56,11 @@ export const TRIANGLE_STEPS: readonly number[] = Array.from({ length: 32 }, (_, 
  * registers, and the rate the note adapter updates a ramp or a bend at.
  */
 export const FRAME_HZ = CPU_HZ / 29780.5;
+
+/**
+ * `$4010` low nibble → DMC timer period in CPU cycles, NTSC: one delta bit per
+ * period, so 4.2 kHz at the slowest to 33.1 kHz at the fastest.
+ */
+export const DMC_PERIODS = [
+  428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54,
+] as const;

@@ -11,9 +11,11 @@ whatever game they came from.
 
 It was written to play Battletoads note for note from its decoded cartridge,
 and is the synth for the music chapters of [xrom.dev](https://xrom.dev) as
-they come out.
+they come out. **Try it live in the browser:
+[xrom.dev/utils/apu](https://xrom.dev/utils/apu).**
 
-- No dependencies, ~5 KB gzipped, runs anywhere JavaScript does (browser, worker, Node).
+- All five channels: two pulses, the triangle, noise and the DMC (samples).
+- No dependencies, ~6 KB gzipped, runs anywhere JavaScript does (browser, worker, Node).
 - Pure and deterministic: the same writes always give the same samples, so it
   can be tested by measuring rather than by ear.
 - Hardware-faithful where it is audible: the real duty sequences, the noise
@@ -27,7 +29,7 @@ they come out.
 npm install @xromdev/apu
 ```
 
-## Two ways in
+## Three ways in
 
 ### Register writes
 
@@ -80,24 +82,61 @@ Write to it as the CPU does, and pull a block of samples whenever the audio
 side wants one:
 
 ```ts
-import { Apu, mixApu, OutputFilters } from '@xromdev/apu';
+import { Apu, mixApu, OutputFilters, type ChannelBuffers } from '@xromdev/apu';
 
 const rate = 48000;
 const chip = new Apu(rate);
 const filters = new OutputFilters(rate, false);
-const p1 = new Uint8Array(128), p2 = new Uint8Array(128), tri = new Uint8Array(128);
-const noise = new Float64Array(128);
+const n = 128;
+const levels: ChannelBuffers = {
+  pulse1: new Uint8Array(n), pulse2: new Uint8Array(n), triangle: new Uint8Array(n),
+  noise: new Float64Array(n), dmc: new Uint8Array(n),
+};
 
 chip.write(0x4015, 0x01); // …whenever the CPU writes
 
 function nextBlock(out: Float32Array) {
-  chip.render(out.length, p1, p2, tri, noise);
-  for (let i = 0; i < out.length; i++) out[i] = filters.step(mixApu(p1[i], p2[i], tri[i], noise[i]));
+  chip.render(out.length, levels);
+  const { pulse1, pulse2, triangle, noise, dmc } = levels;
+  for (let i = 0; i < out.length; i++) {
+    out[i] = 2.2 * filters.step(mixApu(pulse1[i], pulse2[i], triangle[i], noise[i], dmc[i]));
+  }
 }
 ```
 
+That is the whole of an AudioWorklet processor: the playground at
+[xrom.dev/utils/apu](https://xrom.dev/utils/apu) runs exactly this. The
+per-channel levels are also what to draw an oscilloscope from, and
+`chip.snapshot()` gives the chip's own counters — length, envelope, linear
+counter, sweep mute — for showing what it is doing.
+
 `chip.levels()` does the same one sample at a time; `render` gives identical
 numbers several times faster.
+
+### Samples: the DMC
+
+The fifth channel plays 1-bit delta samples from cartridge memory. Hand the
+chip that memory — the bytes of `$8000`–`$FFFF`, or a function that reads any
+address — and start a sample the way a game does:
+
+```ts
+const cartridge = new Uint8Array(0x8000); // $8000–$FFFF
+cartridge.set(sampleBytes, 0x4000);        // a sample at $C000
+
+renderWrites(
+  [
+    { time: 0, address: 0x4010, value: 0x0f }, // rate 15 (33 kHz), no loop
+    { time: 0, address: 0x4012, value: 0x00 }, // start at $C000 + 0 × 64
+    { time: 0, address: 0x4013, value: 0x20 }, // 0x20 × 16 + 1 = 513 bytes
+    { time: 0, address: 0x4015, value: 0x10 }, // go
+  ],
+  1,
+  { memory: cartridge }
+);
+```
+
+`$4011` sets the output level directly — which is also how games play raw PCM,
+one write per sample, without the DMC's reader at all.
 
 ## Playing it in a browser
 
@@ -116,7 +155,7 @@ do it in a Worker so the page never stalls.
 
 ## Size and speed
 
-- **~12 KB minified, ~5 KB gzipped**, no dependencies.
+- **~14 KB minified, ~6 KB gzipped**, no dependencies.
 - **About 500× faster than real time** at the default 2× oversampling: all 20
   Battletoads tracks — 16 minutes of music, 110 000 register writes — render in
   under 2 s on a laptop; the longest, 108 s, in 0.2 s (0.11 s without
@@ -139,10 +178,11 @@ test suite checks the fast paths against the plain ones bit for bit.
 | `sampleRate` | 44100 | |
 | `oversample` | 2 | Run the chip at 2× and average down. Square waves alias badly at 44.1 kHz without it. |
 | `gain` | 2.2 | Master level. |
-| `voiceLevels` | `[1,1,1,1]` | A fader per channel, applied before the mixer. Not on the console — the triangle has no volume at all — but it is how you hear one voice alone. |
+| `voiceLevels` | `[1,1,1,1,1]` | A fader per channel — pulse 1, pulse 2, triangle, noise, DMC — applied before the mixer. Not on the console (the triangle has no volume at all), but it is how you hear one voice alone. |
 | `filters` | true | The console's analogue stage. Off gives the raw mixer. |
 | `consoleBass` | false | Add the console's 440 Hz high-pass. Real, but it takes 18 dB off a bass line at 82 Hz; on a television that was the sound, in headphones it is just thin. |
 | `lengthCounter` | true | Off to hear what the length counters are doing. |
+| `memory` | — | Cartridge memory for the DMC: a `Uint8Array` of `$8000`–`$FFFF`, or `(address) => byte`. |
 
 `renderNotes` also takes `lead` (seconds of silence first) and `metronome`
 (a click every N ticks, mixed after the filters so it never sounds like the chip).
@@ -161,13 +201,28 @@ test suite checks the fast paths against the plain ones bit for bit.
   high takes level from the noise channel beside it.
 - **Pulse 1 and pulse 2 sweep differently by one.** Pulse 1 negates with one's
   complement, pulse 2 with two's.
+- **The DMC's level sticks.** A sample steps the output up or down by 2 per bit
+  and it stays wherever the sample left it — and, like the triangle, a high DMC
+  level makes the triangle and noise quieter through the shared mixer.
 
 ## Not modelled
 
-- **The DMC** (`$4010`–`$4013`, sampled sound). Writes to it are ignored.
-- The frame IRQ, and the handful of races between a write and a clock landing
-  on the same CPU cycle.
+- The DMC's and the frame counter's IRQs, and the CPU cycles the DMC steals
+  for its memory reads.
+- The handful of races between a write and a clock landing on the same CPU
+  cycle.
 - PAL timings. Everything is NTSC.
+
+## API at a glance
+
+| | |
+|---|---|
+| `renderWrites(writes, seconds, options?)` | Register writes → `{ samples, sampleRate, duration, peak }`. |
+| `renderNotes(input, options?)` / `notesToWrites(input)` | Decoded notes → samples, or → the writes a driver would make. |
+| `new Apu(sampleRate, { memory?, lengthCounter? })` | The chip itself: `write(address, value)`, `render(count, buffers)`, `levels()`, `snapshot()`. |
+| `mixApu(p1, p2, tri, noise, dmc?)`, `OutputFilters` | The non-linear mixer and the console's analogue stage, for use with `Apu`. |
+| `sweepTrace(period, sweep, channel, halfFrames)` | The period the sweep unit plays, half-frame by half-frame — for drawing a swept sound. |
+| `CPU_HZ`, `FRAME_HZ`, `LENGTH_TABLE`, `NOISE_PERIODS`, `DMC_PERIODS`, `DUTY_SEQUENCES` | The hardware's numbers. |
 
 ## Development
 

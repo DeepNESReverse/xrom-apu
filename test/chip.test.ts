@@ -138,8 +138,8 @@ describe('the noise channel, through its registers', () => {
 });
 
 describe('writes', () => {
-  it('ignores addresses outside the APU, and the DMC registers it does not model', () => {
-    const quiet = render([at(0, 0x2000, 0xff), at(0, 0x4010, 0xff), at(0, 0x4011, 0x7f)], 0.1);
+  it('ignores addresses outside the APU', () => {
+    const quiet = render([at(0, 0x2000, 0xff), at(0, 0x4016, 0xff), at(0, 0x4009, 0xff)], 0.1);
     expect(quiet.peak).toBe(0);
   });
 
@@ -168,32 +168,45 @@ describe('speed-ups that must not change a sample', () => {
       chip.write(0x400c, 0x04);
       chip.write(0x400e, 0x03);
       chip.write(0x400f, 0x18);
+      chip.write(0x4011, 0x40);
+      chip.write(0x4010, 0x4c);
+      chip.write(0x4012, 0x00);
+      chip.write(0x4013, 0x20);
+      chip.write(0x4015, 0x1f);
     };
     const n = 40000;
-    const a = new Apu(44100);
-    const b = new Apu(44100);
+    // Something with a shape for the DMC to read: a byte counter.
+    const memory = Uint8Array.from({ length: 0x8000 }, (_, i) => (i * 37) & 0xff);
+    const a = new Apu(44100, { memory });
+    const b = new Apu(44100, { memory });
     program(a);
     program(b);
-    const one = { p1: [] as number[], p2: [] as number[], t: [] as number[], n: [] as number[] };
+    const one = { p1: [] as number[], p2: [] as number[], t: [] as number[], n: [] as number[], d: [] as number[] };
     for (let i = 0; i < n; i++) {
-      const [x, y, z, w] = a.levels();
+      const [x, y, z, w, v] = a.levels();
       one.p1.push(x);
       one.p2.push(y);
       one.t.push(z);
       one.n.push(w);
+      one.d.push(v);
     }
-    const p1 = new Uint8Array(n);
-    const p2 = new Uint8Array(n);
-    const t = new Uint8Array(n);
-    const noise = new Float64Array(n);
+    const buffers = {
+      pulse1: new Uint8Array(n),
+      pulse2: new Uint8Array(n),
+      triangle: new Uint8Array(n),
+      noise: new Float64Array(n),
+      dmc: new Uint8Array(n),
+    };
+    const { pulse1: p1, pulse2: p2, triangle: t, noise } = buffers;
     // Uneven blocks, so the cuts land everywhere relative to the frame counter.
     for (let done = 0, size = 1; done < n; done += size, size = (size * 7) % 997 || 1) {
-      b.render(Math.min(size, n - done), p1, p2, t, noise, done);
+      b.render(Math.min(size, n - done), buffers, done);
     }
     expect(Array.from(p1)).toEqual(one.p1);
     expect(Array.from(p2)).toEqual(one.p2);
     expect(Array.from(t)).toEqual(one.t);
     expect(Array.from(noise)).toEqual(one.n);
+    expect(Array.from(buffers.dmc)).toEqual(one.d);
   });
 
   it('holds the whole shift-register cycle in its table', async () => {
@@ -230,5 +243,94 @@ describe('snapshot', () => {
     expect(s.pulse[0].muted).toBe(true);
     expect(s.pulse[1].enabled).toBe(false);
     expect(s.triangle).toMatchObject({ length: 254, enabled: true });
+  });
+});
+
+describe('the DMC, through its registers', () => {
+  const DMC_RATE_15 = CPU_HZ / 54;
+  /** A cartridge's upper half filled with one byte, for the DMC to read. */
+  const filled = (byte: number) => new Uint8Array(0x8000).fill(byte);
+  const renderWith = (writes: RegisterWrite[], seconds: number, memory?: Uint8Array) =>
+    renderWrites(writes, seconds, { sampleRate: RATE, oversample: 1, filters: false, tail: 0, memory });
+
+  it('jumps straight to a level written to $4011', () => {
+    const { samples } = renderWith([at(0.05, 0x4011, 0x7f)], 0.1);
+    expect(peakIn(samples, 0, 0.049)).toBe(0);
+    expect(peakIn(samples, 0.051, 0.1)).toBeGreaterThan(0);
+  });
+
+  it('plays a sample at the rate $4010 sets, one bit per timer period', () => {
+    // $0F is four 1-bits then four 0-bits: up 8, down 8 — a square wave with
+    // a period of eight bits, so at rate 15 it sounds at the bit rate over 8.
+    const { samples } = renderWith(
+      [at(0, 0x4011, 0x40), at(0, 0x4010, 0x4f), at(0, 0x4012, 0x00), at(0, 0x4013, 0x10), at(0, 0x4015, 0x10)],
+      0.3,
+      filled(0x0f)
+    );
+    expect(measureHz(samples, 0.05, 0.25)).toBeGreaterThan((DMC_RATE_15 / 8) * 0.98);
+    expect(measureHz(samples, 0.05, 0.25)).toBeLessThan((DMC_RATE_15 / 8) * 1.02);
+  });
+
+  it('stops at the end of the sample unless it loops', () => {
+    // $4013 = 0 is a one-byte sample: eight bits, then silence.
+    const common = [at(0, 0x4011, 0x40), at(0, 0x4012, 0x00), at(0, 0x4013, 0x00)];
+    const once = renderWith([...common, at(0, 0x4010, 0x0f), at(0, 0x4015, 0x10)], 0.2, filled(0x0f));
+    const looped = renderWith([...common, at(0, 0x4010, 0x4f), at(0, 0x4015, 0x10)], 0.2, filled(0x0f));
+    const moving = (s: Float32Array) => {
+      const tail = s.subarray(Math.round(0.1 * RATE));
+      return Math.max(...tail) - Math.min(...tail);
+    };
+    expect(moving(once.samples)).toBe(0);
+    expect(moving(looped.samples)).toBeGreaterThan(0);
+  });
+
+  it('is stopped by clearing bit 4 of $4015', () => {
+    const writes = [
+      at(0, 0x4011, 0x40),
+      at(0, 0x4010, 0x4f),
+      at(0, 0x4012, 0x00),
+      at(0, 0x4013, 0xff),
+      at(0, 0x4015, 0x10),
+      at(0.1, 0x4015, 0x00),
+    ];
+    const { samples } = renderWith(writes, 0.3, filled(0x0f));
+    const tail = samples.subarray(Math.round(0.15 * RATE));
+    expect(Math.max(...tail) - Math.min(...tail)).toBe(0);
+    expect(measureHz(samples, 0.01, 0.09)).toBeGreaterThan(0);
+  });
+
+  it('reads where $4012 points, and takes a reader function as memory', () => {
+    // $4012 = 4 is $C100. Only that byte is all ones; a sample started there
+    // climbs, one started at $C000 falls.
+    const reads: number[] = [];
+    const memory = (address: number) => {
+      reads.push(address);
+      return address === 0xc100 ? 0xff : 0x00;
+    };
+    const writes = (page: number) => [at(0, 0x4011, 0x40), at(0, 0x4012, page), at(0, 0x4013, 0x00), at(0, 0x4015, 0x10)];
+    const up = renderWrites(writes(4), 0.01, { sampleRate: RATE, oversample: 1, filters: false, tail: 0, memory });
+    expect(reads[0]).toBe(0xc100);
+    const down = renderWrites(writes(0), 0.01, { sampleRate: RATE, oversample: 1, filters: false, tail: 0, memory });
+    const last = (s: Float32Array) => s[s.length - 1];
+    expect(last(up.samples)).toBeGreaterThan(last(down.samples));
+  });
+
+  it('adds exactly nothing to the mix while silent', async () => {
+    const { mixApu } = await import('../src/index.js');
+    for (const [p, t, n] of [[3, 7, 4.5], [15, 0, 0], [0, 15, 12.25]]) {
+      expect(mixApu(p, p, t, n, 0)).toBe(mixApu(p, p, t, n));
+    }
+  });
+
+  it('shows up in the snapshot', async () => {
+    const { Apu } = await import('../src/index.js');
+    const chip = new Apu(44100, { memory: filled(0x55) });
+    chip.write(0x4010, 0x4a);
+    chip.write(0x4012, 0x02);
+    chip.write(0x4013, 0x03);
+    chip.write(0x4015, 0x10);
+    const s = chip.snapshot().dmc;
+    expect(s).toMatchObject({ rateIndex: 10, loop: true, enabled: true });
+    expect(s.remaining).toBe(3 * 16 + 1 - 1); // one byte already fetched into the buffer
   });
 });
