@@ -74,6 +74,55 @@ export interface ApuInput {
    * intro every time round. Absent means the piece does not loop.
    */
   loopStart?: number;
+  /**
+   * Changes of tempo, as `{ tick, secondsPerTick }` in tick order: from `tick`
+   * on, a tick lasts `secondsPerTick`. Before the first change it is the
+   * input's own `secondsPerTick`. For drivers with a tempo command — Battletoads
+   * speeds its opening up this way — whose ticks are not all the same length.
+   */
+  tempo?: readonly TempoChange[];
+}
+
+export interface TempoChange {
+  tick: number;
+  secondsPerTick: number;
+}
+
+/**
+ * Seconds from the start to `tick`, through the tempo changes. With none it is
+ * exactly `tick * secondsPerTick` — the same float, so a piece without changes
+ * renders as it always has.
+ */
+export function tickToSeconds(input: Pick<ApuInput, 'secondsPerTick' | 'tempo'>, tick: number): number {
+  const changes = input.tempo;
+  if (!changes || changes.length === 0) return tick * input.secondsPerTick;
+  let seconds = 0;
+  let from = 0;
+  let spt = input.secondsPerTick;
+  for (const change of changes) {
+    if (change.tick >= tick) break;
+    seconds += (change.tick - from) * spt;
+    from = change.tick;
+    spt = change.secondsPerTick;
+  }
+  return seconds + (tick - from) * spt;
+}
+
+/** The tick at `seconds` — the inverse of `tickToSeconds`, fractional. */
+export function secondsToTick(input: Pick<ApuInput, 'secondsPerTick' | 'tempo'>, seconds: number): number {
+  const changes = input.tempo;
+  if (!changes || changes.length === 0) return seconds / input.secondsPerTick;
+  let at = 0;
+  let from = 0;
+  let spt = input.secondsPerTick;
+  for (const change of changes) {
+    const end = at + (change.tick - from) * spt;
+    if (end >= seconds) break;
+    at = end;
+    from = change.tick;
+    spt = change.secondsPerTick;
+  }
+  return from + (seconds - at) / spt;
 }
 
 export interface ApuOptions extends Omit<RenderOptions, 'clicks' | 'tail'> {
@@ -184,7 +233,7 @@ function* frames(start: number, end: number) {
  * @param lead seconds of silence before tick 0
  */
 export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
-  const spt = input.secondsPerTick;
+  const at = (tick: number) => tickToSeconds(input, tick);
   const bends = input.bends ?? [];
   const writes: RegisterWrite[] = [];
   const put = (time: number, address: number, value: number) =>
@@ -203,8 +252,8 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
     rows
       .filter(keep as (row: PitchedRow | DrumRow) => boolean)
       .map((row) => ({
-        start: lead + row[1] * spt,
-        end: lead + (row[1] + row[2]) * spt,
+        start: lead + at(row[1]),
+        end: lead + at(row[1] + row[2]),
         row,
       }))
       .filter((voice) => voice.end > voice.start)
@@ -341,18 +390,18 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
 /** Render a decoded piece: `notesToWrites` into `renderWrites`, with the tick-based extras. */
 export function renderNotes(input: ApuInput, options: ApuOptions = {}): ApuRender {
   const lead = options.lead ?? 0;
-  const spt = input.secondsPerTick;
 
   const clicks: Click[] = [];
   if (options.metronome && options.metronome > 0) {
     for (let tick = 0, beat = 0; tick < input.totalTicks; tick += options.metronome, beat++) {
       // Four beats to a bar: the downbeat is what makes a tempo readable.
-      clicks.push({ time: lead + tick * spt, strong: beat % 4 === 0 });
+      clicks.push({ time: lead + tickToSeconds(input, tick), strong: beat % 4 === 0 });
     }
   }
 
   const { lead: _lead, metronome: _metronome, ...render } = options;
-  const result = renderWrites(notesToWrites(input, lead), lead + input.totalTicks * spt, {
+  const end = tickToSeconds(input, input.totalTicks);
+  const result = renderWrites(notesToWrites(input, lead), lead + end, {
     ...render,
     clicks,
   });
@@ -362,8 +411,8 @@ export function renderNotes(input: ApuInput, options: ApuOptions = {}): ApuRende
     sampleRate: result.sampleRate,
     lead,
     duration: result.duration,
-    loopStart: lead + Math.min(input.loopStart ?? 0, input.totalTicks) * spt,
-    loopEnd: lead + input.totalTicks * spt,
+    loopStart: lead + tickToSeconds(input, Math.min(input.loopStart ?? 0, input.totalTicks)),
+    loopEnd: lead + end,
     peak: result.peak,
   };
 }

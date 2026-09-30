@@ -55,4 +55,7 @@ export {
   type BendCurve,
   type DrumRow,
   type PitchedRow,
+  secondsToTick,
+  tickToSeconds,
+  type TempoChange,
 } from './notes.js';

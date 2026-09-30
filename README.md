@@ -73,6 +73,12 @@ const melody: PitchedRow[] = [
 const render = renderNotes({ pitched: melody, drums: [], secondsPerTick: 0.1, totalTicks: 8 });
 ```
 
+A driver with a tempo command has ticks of more than one length: give the
+changes as `tempo: [{ tick, secondsPerTick }]` — from `tick` on, a tick lasts
+that long — and notes, loop points and the metronome follow them.
+`tickToSeconds(input, tick)` and `secondsToTick` convert for anything drawn
+alongside.
+
 `notesToWrites` gives you the writes on their own, if you want to see them.
 
 ### Live
@@ -219,6 +225,7 @@ test suite checks the fast paths against the plain ones bit for bit.
 |---|---|
 | `renderWrites(writes, seconds, options?)` | Register writes → `{ samples, sampleRate, duration, peak }`. |
 | `renderNotes(input, options?)` / `notesToWrites(input)` | Decoded notes → samples, or → the writes a driver would make. |
+| `tickToSeconds(input, tick)` / `secondsToTick(input, s)` | Ticks ↔ seconds through the input's `tempo` changes. |
 | `new Apu(sampleRate, { memory?, lengthCounter? })` | The chip itself: `write(address, value)`, `render(count, buffers)`, `levels()`, `snapshot()`. |
 | `mixApu(p1, p2, tri, noise, dmc?)`, `OutputFilters` | The non-linear mixer and the console's analogue stage, for use with `Apu`. |
 | `sweepTrace(period, sweep, channel, halfFrames)` | The period the sweep unit plays, half-frame by half-frame — for drawing a swept sound. |
