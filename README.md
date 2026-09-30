@@ -7,8 +7,9 @@ cartridge writes to the registers `$4000`–`$4017`, sixty times a second. This
 library is those registers. Give it the writes and it gives you back the sound,
 whatever game they came from.
 
-It is the synth behind the music pages on [xrom.dev](https://xrom.dev), where
-it plays Battletoads note for note from the decoded cartridge.
+It was written to play Battletoads note for note from its decoded cartridge,
+and is the synth for the music chapters of [xrom.dev](https://xrom.dev) as
+they come out.
 
 - No dependencies, runs anywhere JavaScript does (browser, worker, Node).
 - Pure and deterministic: the same writes always give the same samples, so it
