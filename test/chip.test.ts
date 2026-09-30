@@ -152,3 +152,64 @@ describe('writes', () => {
     expect(render(late, 0.1).peak).toBe(0);
   });
 });
+
+describe('speed-ups that must not change a sample', () => {
+  it('fills the same levels in blocks as one sample at a time', async () => {
+    const { Apu } = await import('../src/index.js');
+    const program = (chip: InstanceType<typeof Apu>) => {
+      chip.write(0x4015, 0x0f);
+      chip.write(0x4000, 0x9f);
+      chip.write(0x4001, 0x8b);
+      chip.write(0x4002, 0x90);
+      chip.write(0x4003, 0x09);
+      chip.write(0x4008, 0x7f);
+      chip.write(0x400a, 0x40);
+      chip.write(0x400b, 0x21);
+      chip.write(0x400c, 0x04);
+      chip.write(0x400e, 0x03);
+      chip.write(0x400f, 0x18);
+    };
+    const n = 40000;
+    const a = new Apu(44100);
+    const b = new Apu(44100);
+    program(a);
+    program(b);
+    const one = { p1: [] as number[], p2: [] as number[], t: [] as number[], n: [] as number[] };
+    for (let i = 0; i < n; i++) {
+      const [x, y, z, w] = a.levels();
+      one.p1.push(x);
+      one.p2.push(y);
+      one.t.push(z);
+      one.n.push(w);
+    }
+    const p1 = new Uint8Array(n);
+    const p2 = new Uint8Array(n);
+    const t = new Uint8Array(n);
+    const noise = new Float64Array(n);
+    // Uneven blocks, so the cuts land everywhere relative to the frame counter.
+    for (let done = 0, size = 1; done < n; done += size, size = (size * 7) % 997 || 1) {
+      b.render(Math.min(size, n - done), p1, p2, t, noise, done);
+    }
+    expect(Array.from(p1)).toEqual(one.p1);
+    expect(Array.from(p2)).toEqual(one.p2);
+    expect(Array.from(t)).toEqual(one.t);
+    expect(Array.from(noise)).toEqual(one.n);
+  });
+
+  it('holds the whole shift-register cycle in its table', async () => {
+    const { LONG_CYCLE, LONG_STATES, LONG_INDEX, LONG_HIGH_BEFORE } = await import('../src/lfsr.js');
+    let state = 1;
+    let high = 0;
+    for (let i = 0; i < LONG_CYCLE; i++) {
+      expect(LONG_STATES[i]).toBe(state);
+      expect(LONG_INDEX[state]).toBe(i);
+      expect(LONG_HIGH_BEFORE[i]).toBe(high);
+      if ((state & 1) === 0) high++;
+      const feedback = (state & 1) ^ ((state >> 1) & 1);
+      state = (state >> 1) | (feedback << 14);
+    }
+    // One cycle through every non-zero state and back to the start.
+    expect(state).toBe(1);
+    expect(LONG_HIGH_BEFORE[LONG_CYCLE]).toBe(high);
+  });
+});

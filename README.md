@@ -11,7 +11,7 @@ It was written to play Battletoads note for note from its decoded cartridge,
 and is the synth for the music chapters of [xrom.dev](https://xrom.dev) as
 they come out.
 
-- No dependencies, runs anywhere JavaScript does (browser, worker, Node).
+- No dependencies, ~5 KB gzipped, runs anywhere JavaScript does (browser, worker, Node).
 - Pure and deterministic: the same writes always give the same samples, so it
   can be tested by measuring rather than by ear.
 - Hardware-faithful where it is audible: the real duty sequences, the noise
@@ -73,22 +73,29 @@ const render = renderNotes({ pitched: melody, drums: [], secondsPerTick: 0.1, to
 
 ### Live
 
-`Apu` is the chip one sample at a time, for a live source such as a running
-emulator:
+`Apu` is the chip on its own, for a live source such as a running emulator.
+Write to it as the CPU does, and pull a block of samples whenever the audio
+side wants one:
 
 ```ts
 import { Apu, mixApu, OutputFilters } from 'xrom-apu';
 
-const chip = new Apu(48000);
-const filters = new OutputFilters(48000, false);
+const rate = 48000;
+const chip = new Apu(rate);
+const filters = new OutputFilters(rate, false);
+const p1 = new Uint8Array(128), p2 = new Uint8Array(128), tri = new Uint8Array(128);
+const noise = new Float64Array(128);
 
 chip.write(0x4015, 0x01); // …whenever the CPU writes
 
-function nextSample() {
-  const [p1, p2, tri, noise] = chip.levels();
-  return filters.step(mixApu(p1, p2, tri, noise));
+function nextBlock(out: Float32Array) {
+  chip.render(out.length, p1, p2, tri, noise);
+  for (let i = 0; i < out.length; i++) out[i] = filters.step(mixApu(p1[i], p2[i], tri[i], noise[i]));
 }
 ```
+
+`chip.levels()` does the same one sample at a time; `render` gives identical
+numbers several times faster.
 
 ## Playing it in a browser
 
@@ -102,8 +109,24 @@ source.connect(context.destination);
 source.start();
 ```
 
-A long piece takes a noticeable fraction of a second to render; do it in a
-Worker to keep the page responsive.
+Rendering takes about 0.2 s for 100 s of music (see below); for long pieces,
+do it in a Worker so the page never stalls.
+
+## Size and speed
+
+- **~12 KB minified, ~5 KB gzipped**, no dependencies.
+- **About 500× faster than real time** at the default 2× oversampling: all 20
+  Battletoads tracks — 16 minutes of music, 110 000 register writes — render in
+  under 2 s on a laptop; the longest, 108 s, in 0.2 s (0.11 s without
+  oversampling). The output buffer is 176 KB per second of sound.
+
+How: anything that only changes when a register is written — each channel's
+step per sample, whether the sweep unit mutes it — is worked out at the write,
+not every sample; the chip fills runs of samples a channel at a time between
+events; the noise register's whole 32 767-state cycle is a table, so N shifts
+are one lookup; the mixer's common cases are tables built with its own formula;
+the filters allocate nothing per sample. None of it changes a sample: the
+test suite checks the fast paths against the plain ones bit for bit.
 
 ## Options
 

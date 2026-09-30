@@ -17,6 +17,13 @@
  * Not modelled: the DMC (`$4010`–`$4013` are accepted and ignored), the frame
  * IRQ, and the handful of cycle-exact write/clock races. Periods and levels are
  * the hardware's; timing is exact to the sample.
+ *
+ * **Speed.** `levels()` runs once per sample — 88 200 times a second of music at
+ * the default oversampling — so anything that only changes when a register is
+ * written (a channel's step per sample, whether the sweep unit mutes it) is
+ * worked out at the write and kept, not recomputed here. The expressions are the
+ * same ones, evaluated at a different moment, so the output is bit for bit what
+ * recomputing them every sample gives.
  */
 
 import {
@@ -27,7 +34,12 @@ import {
   QUARTER_FRAME_HZ,
   TRIANGLE_STEPS,
 } from './constants.js';
+import { LONG_CYCLE, LONG_HIGH_BEFORE, LONG_INDEX, LONG_STATES } from './lfsr.js';
 import { decodeSweep, sweepMutes, sweepTarget, type SweepConfig } from './sweep.js';
+
+/** The four duty sequences flattened, `duty * 8 + step`. */
+const DUTY_FLAT = Uint8Array.from(DUTY_SEQUENCES.flat());
+const TRIANGLE_FLAT = Uint8Array.from(TRIANGLE_STEPS);
 
 interface Envelope {
   start: boolean;
@@ -53,6 +65,10 @@ interface Pulse {
   enabled: boolean;
   /** Position in the 8-step duty sequence, fractional. */
   phase: number;
+  /** Steps of the sequence per sample, from `period` — kept, see "Speed". */
+  step: number;
+  /** Whether the sweep unit mutes the channel at this period — kept, see "Speed". */
+  muted: boolean;
 }
 
 interface Triangle {
@@ -65,6 +81,7 @@ interface Triangle {
   length: number;
   enabled: boolean;
   phase: number;
+  step: number;
 }
 
 interface Noise {
@@ -77,9 +94,16 @@ interface Noise {
   periodIndex: number;
   length: number;
   enabled: boolean;
+  /**
+   * The register. In normal mode it is held as a position in the precomputed
+   * cycle (`lfsrIndex`) and `lfsr` is stale; in short mode `lfsr` is the state.
+   * A mode switch converts one into the other.
+   */
   lfsr: number;
+  lfsrIndex: number;
   /** Fractional timer position: how many register shifts are owed. */
   phase: number;
+  step: number;
 }
 
 export interface ApuChipOptions {
@@ -107,11 +131,9 @@ const newPulse = (pulse1: boolean): Pulse => ({
   length: 0,
   enabled: false,
   phase: 0,
+  step: 0,
+  muted: true,
 });
-
-/** Envelope output: the written level, or the decay counter the chip runs itself. */
-const envelopeLevel = (constant: boolean, volume: number, env: Envelope) =>
-  constant ? volume : env.decay;
 
 /** One quarter-frame of an envelope, in the hardware's order. */
 function clockEnvelope(env: Envelope, period: number, loop: boolean) {
@@ -147,6 +169,7 @@ export class Apu {
     // first note — the part of power-on a listener would otherwise hear as a
     // thump.
     phase: 16,
+    step: 0,
   };
   private readonly noise: Noise = {
     halt: false,
@@ -158,7 +181,9 @@ export class Apu {
     length: 0,
     enabled: false,
     lfsr: 1, // the chip powers up with bit 0 set
+    lfsrIndex: LONG_INDEX[1],
     phase: 0,
+    step: 0,
   };
 
   /** Frame counter: 5-step mode, which step is next, samples until it. */
@@ -174,6 +199,9 @@ export class Apu {
     this.lengthCounter = options.lengthCounter !== false;
     this.samplesPerQuarterFrame = sampleRate / QUARTER_FRAME_HZ;
     this.frameCountdown = this.samplesPerQuarterFrame;
+    for (const p of this.pulses) this.retunePulse(p);
+    this.retuneTriangle();
+    this.retuneNoise();
   }
 
   /** A CPU write to one of the APU's registers. Anything outside `$4000`–`$4017` is ignored. */
@@ -194,12 +222,14 @@ export class Apu {
         const p = this.pulses[address === 0x4001 ? 0 : 1];
         p.sweep = decodeSweep(v, p.pulse1);
         p.sweepReload = true;
+        p.muted = sweepMutes(p.period, p.sweep);
         return;
       }
       case 0x4002:
       case 0x4006: {
         const p = this.pulses[address === 0x4002 ? 0 : 1];
         p.period = (p.period & 0x700) | v;
+        this.retunePulse(p);
         return;
       }
       case 0x4003:
@@ -213,6 +243,7 @@ export class Apu {
         if (p.enabled) p.length = LENGTH_TABLE[v >> 3];
         p.env.start = true;
         p.phase = 0;
+        this.retunePulse(p);
         return;
       }
       case 0x4008:
@@ -221,6 +252,7 @@ export class Apu {
         return;
       case 0x400a:
         this.triangle.period = (this.triangle.period & 0x700) | v;
+        this.retuneTriangle();
         return;
       case 0x400b:
         // No phase reset here: the triangle's sequencer is never restarted, so
@@ -228,16 +260,25 @@ export class Apu {
         this.triangle.period = (this.triangle.period & 0xff) | ((v & 7) << 8);
         if (this.triangle.enabled) this.triangle.length = LENGTH_TABLE[v >> 3];
         this.triangle.linearReloadFlag = true;
+        this.retuneTriangle();
         return;
       case 0x400c:
         this.noise.halt = (v & 0x20) !== 0;
         this.noise.constant = (v & 0x10) !== 0;
         this.noise.volume = v & 0x0f;
         return;
-      case 0x400e:
-        this.noise.shortMode = (v & 0x80) !== 0;
-        this.noise.periodIndex = v & 0x0f;
+      case 0x400e: {
+        const n = this.noise;
+        const shortMode = (v & 0x80) !== 0;
+        // Hand the register between its two representations: a position in the
+        // precomputed cycle for normal mode, the raw state for short mode.
+        if (shortMode && !n.shortMode) n.lfsr = LONG_STATES[n.lfsrIndex];
+        if (!shortMode && n.shortMode) n.lfsrIndex = LONG_INDEX[n.lfsr];
+        n.shortMode = shortMode;
+        n.periodIndex = v & 0x0f;
+        this.retuneNoise();
         return;
+      }
       case 0x400f:
         if (this.noise.enabled) this.noise.length = LENGTH_TABLE[v >> 3];
         this.noise.env.start = true;
@@ -267,31 +308,103 @@ export class Apu {
     }
   }
 
+  /** Scratch buffers for `levels()`, one sample long. */
+  private readonly one = [new Uint8Array(1), new Uint8Array(1), new Uint8Array(1), new Float64Array(1)] as const;
+
   /**
    * Advance one sample and return the four channel levels, `[pulse1, pulse2,
-   * triangle, noise]`, each 0..15 (noise can be fractional: see below). The
-   * array is reused between calls.
+   * triangle, noise]`, each 0..15 (noise can be fractional: see `fill`). The
+   * array is reused between calls. For more than a sample at a time, `render`
+   * is several times faster and gives the same numbers.
    */
   levels(): readonly number[] {
-    this.frameCountdown -= 1;
-    while (this.frameCountdown <= 0) {
-      this.frameCountdown += this.samplesPerQuarterFrame;
-      this.clockFrameCounter();
-    }
+    const [a, b, c, d] = this.one;
+    this.render(1, a, b, c, d, 0);
+    const out = this.out;
+    out[0] = a[0];
+    out[1] = b[0];
+    out[2] = c[0];
+    out[3] = d[0];
+    return out;
+  }
 
-    const rate = this.sampleRate;
+  /**
+   * Advance `count` samples, writing each channel's level into its buffer from
+   * `offset` on. The pulses and the triangle are whole numbers 0..15, hence the
+   * byte arrays; the noise is fractional (its gate is averaged over the shifts
+   * in a sample). No register writes happen inside — a caller with writes due
+   * splits the run at them.
+   *
+   * The frame counter is the only thing that changes a channel's parameters
+   * between writes, so the run is cut at its clocks and each piece is filled a
+   * channel at a time (`fill`). Every sum is the one `levels()` would do, in the
+   * same order — the buffers come out bit for bit the same as `count` calls.
+   */
+  render(
+    count: number,
+    pulse1: Uint8Array,
+    pulse2: Uint8Array,
+    triangle: Uint8Array,
+    noise: Float64Array,
+    offset = 0
+  ) {
+    let done = 0;
+    while (done < count) {
+      // Samples before the one on which the counter reaches zero. Subtracting
+      // them in one go is exact: the counter holds a value whose fractional
+      // bits are all representable after taking off a whole number.
+      const free = Math.ceil(this.frameCountdown) - 1;
+      if (free <= 0) {
+        this.frameCountdown -= 1;
+        while (this.frameCountdown <= 0) {
+          this.frameCountdown += this.samplesPerQuarterFrame;
+          this.clockFrameCounter();
+        }
+        this.fill(1, pulse1, pulse2, triangle, noise, offset + done);
+        done += 1;
+      } else {
+        const run = Math.min(free, count - done);
+        this.frameCountdown -= run;
+        this.fill(run, pulse1, pulse2, triangle, noise, offset + done);
+        done += run;
+      }
+    }
+  }
+
+  /** `count` samples with every channel's parameters fixed — tight loops on locals. */
+  private fill(
+    count: number,
+    pulse1: Uint8Array,
+    pulse2: Uint8Array,
+    triangle: Uint8Array,
+    noise: Float64Array,
+    at: number
+  ) {
+    const end = at + count;
 
     for (let i = 0; i < 2; i++) {
       const p = this.pulses[i];
+      const out = i === 0 ? pulse1 : pulse2;
       // A pulse steps through 8 entries per cycle and each entry takes
       // 2 × (period + 1) CPU cycles: CPU / (16 × (period + 1)) per cycle.
-      p.phase += CPU_HZ / (2 * (p.period + 1)) / rate;
-      if (p.phase >= 8) p.phase %= 8;
-      const silent = p.length === 0 || sweepMutes(p.period, p.sweep);
-      this.out[i] = silent
-        ? 0
-        : DUTY_SEQUENCES[p.duty][Math.floor(p.phase) & 7] *
-          envelopeLevel(p.constant, p.volume, p.env);
+      const step = p.step;
+      let phase = p.phase;
+      if (p.length === 0 || p.muted) {
+        for (let k = at; k < end; k++) {
+          phase += step;
+          if (phase >= 8) phase %= 8;
+          out[k] = 0;
+        }
+      } else {
+        const level = p.constant ? p.volume : p.env.decay;
+        const base = p.duty * 8;
+        for (let k = at; k < end; k++) {
+          phase += step;
+          if (phase >= 8) phase %= 8;
+          out[k] = DUTY_FLAT[base + ((phase | 0) & 7)] * level;
+        }
+      }
+      p.phase = phase;
     }
 
     const t = this.triangle;
@@ -299,31 +412,85 @@ export class Apu {
     // runs out the sequencer STOPS where it is and the output holds that step:
     // the triangle is never "at zero" between notes, it is wherever it paused.
     if (t.length > 0 && t.linear > 0) {
-      t.phase += CPU_HZ / (t.period + 1) / rate;
-      if (t.phase >= 32) t.phase %= 32;
+      const step = t.step;
+      let phase = t.phase;
+      for (let k = at; k < end; k++) {
+        phase += step;
+        if (phase >= 32) phase %= 32;
+        triangle[k] = TRIANGLE_FLAT[(phase | 0) & 31];
+      }
+      t.phase = phase;
+    } else {
+      triangle.fill(TRIANGLE_FLAT[(t.phase | 0) & 31], at, end);
     }
-    this.out[2] = TRIANGLE_STEPS[Math.floor(t.phase) & 31];
 
-    const n = this.noise;
-    n.phase += CPU_HZ / NOISE_PERIODS[n.periodIndex] / rate;
-    const shifts = Math.floor(n.phase);
-    n.phase -= shifts;
-    // AVERAGE the register's output across the shifts this sample is worth,
+    // AVERAGE the register's output across the shifts each sample is worth,
     // rather than sampling wherever it lands. At the short periods the LFSR
-    // runs well past the sample rate, and keeping only the last shift folds
-    // the rest back as alias tones — drums like a broken speaker.
-    let high = 0;
-    const tap = n.shortMode ? 6 : 1;
-    for (let i = 0; i < shifts; i++) {
-      // The channel is silenced while bit 0 is set — the register gates it.
-      if ((n.lfsr & 1) === 0) high++;
-      const feedback = (n.lfsr & 1) ^ ((n.lfsr >> tap) & 1);
-      n.lfsr = (n.lfsr >> 1) | (feedback << 14);
+    // runs well past the sample rate, and keeping only the last shift folds the
+    // rest back as alias tones — drums like a broken speaker. The channel is
+    // silenced while bit 0 is set: the register gates it.
+    const n = this.noise;
+    const level = n.length === 0 ? 0 : n.constant ? n.volume : n.env.decay;
+    const step = n.step;
+    let phase = n.phase;
+    if (!n.shortMode) {
+      let index = n.lfsrIndex;
+      if (level === 0) {
+        // Silent, but the register keeps shifting: advance it, output nothing.
+        for (let k = at; k < end; k++) {
+          phase += step;
+          const shifts = Math.floor(phase);
+          phase -= shifts;
+          if (shifts > 0) index = (index + shifts) % LONG_CYCLE;
+        }
+        noise.fill(0, at, end);
+      } else {
+        for (let k = at; k < end; k++) {
+          phase += step;
+          const shifts = Math.floor(phase);
+          phase -= shifts;
+          let gate: number;
+          if (shifts > 0) {
+            gate = (LONG_HIGH_BEFORE[index + shifts] - LONG_HIGH_BEFORE[index]) / shifts;
+            index = (index + shifts) % LONG_CYCLE;
+          } else {
+            gate = (LONG_STATES[index] & 1) === 0 ? 1 : 0;
+          }
+          noise[k] = gate * level;
+        }
+      }
+      n.lfsrIndex = index;
+    } else {
+      let lfsr = n.lfsr;
+      for (let k = at; k < end; k++) {
+        phase += step;
+        const shifts = Math.floor(phase);
+        phase -= shifts;
+        let high = 0;
+        for (let s = 0; s < shifts; s++) {
+          if ((lfsr & 1) === 0) high++;
+          const feedback = (lfsr & 1) ^ ((lfsr >> 6) & 1);
+          lfsr = (lfsr >> 1) | (feedback << 14);
+        }
+        const gate = shifts > 0 ? high / shifts : (lfsr & 1) === 0 ? 1 : 0;
+        noise[k] = level === 0 ? 0 : gate * level;
+      }
+      n.lfsr = lfsr;
     }
-    const gate = shifts > 0 ? high / shifts : (n.lfsr & 1) === 0 ? 1 : 0;
-    this.out[3] = n.length === 0 ? 0 : gate * envelopeLevel(n.constant, n.volume, n.env);
+    n.phase = phase;
+  }
 
-    return this.out;
+  private retunePulse(p: Pulse) {
+    p.step = CPU_HZ / (2 * (p.period + 1)) / this.sampleRate;
+    p.muted = sweepMutes(p.period, p.sweep);
+  }
+
+  private retuneTriangle() {
+    this.triangle.step = CPU_HZ / (this.triangle.period + 1) / this.sampleRate;
+  }
+
+  private retuneNoise() {
+    this.noise.step = CPU_HZ / NOISE_PERIODS[this.noise.periodIndex] / this.sampleRate;
   }
 
   private clockFrameCounter() {
@@ -360,13 +527,9 @@ export class Apu {
 
     for (const p of this.pulses) {
       // The hardware's order: adjust first, then reload or count down.
-      if (
-        p.sweepDivider === 0 &&
-        p.sweep.enabled &&
-        p.sweep.shift > 0 &&
-        !sweepMutes(p.period, p.sweep)
-      ) {
+      if (p.sweepDivider === 0 && p.sweep.enabled && p.sweep.shift > 0 && !p.muted) {
         p.period = Math.max(0, sweepTarget(p.period, p.sweep));
+        this.retunePulse(p);
       }
       if (p.sweepDivider === 0 || p.sweepReload) {
         p.sweepDivider = p.sweep.dividerPeriod;

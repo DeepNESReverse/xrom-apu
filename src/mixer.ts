@@ -19,6 +19,25 @@ export function mixApu(pulse1: number, pulse2: number, triangle: number, noise: 
 }
 
 /**
+ * `mixApu`'s two halves for whole-number inputs, precomputed with the same
+ * expressions — so a lookup gives exactly the float the formula would.
+ *
+ * The pulses are always whole numbers (0..30 summed) unless a fader scales them;
+ * the triangle is a whole step, and the noise is only fractional while it
+ * sounds (its gate is averaged over the shifts in a sample). The renderer uses
+ * these for the common cases and the formula for the rest.
+ */
+export const PULSE_MIX = Float64Array.from({ length: 31 }, (_, sum) =>
+  sum === 0 ? 0 : 95.88 / (8128 / sum + 100)
+);
+
+/** Triangle alone, noise silent: `triangle / 8227 + 0 / 12241` through the curve. */
+export const TRIANGLE_MIX = Float64Array.from({ length: 16 }, (_, level) => {
+  const tnd = level / 8227 + 0 / 12241;
+  return tnd === 0 ? 0 : 159.79 / (1 / tnd + 100);
+});
+
+/**
  * The analogue stage after the mixer, as the console has it.
  *
  * Two RC high-passes (90 Hz and 440 Hz) and a low-pass at 14 kHz, one pole each.
@@ -32,8 +51,12 @@ export function mixApu(pulse1: number, pulse2: number, triangle: number, noise: 
  * thin. `consoleBass` puts it back.
  */
 export class OutputFilters {
-  private hp90Prev = { x: 0, y: 0 };
-  private hp440Prev = { x: 0, y: 0 };
+  // Previous input and output of each stage, as plain numbers: this runs once
+  // per sample, and a fresh object per sample is garbage by the megabyte.
+  private hp90X = 0;
+  private hp90Y = 0;
+  private hp440X = 0;
+  private hp440Y = 0;
   private lowPrev = 0;
   private readonly hp90: number;
   private readonly hp440: number;
@@ -56,13 +79,15 @@ export class OutputFilters {
   }
 
   step(input: number): number {
-    const a = this.hp90 * (this.hp90Prev.y + input - this.hp90Prev.x);
-    this.hp90Prev = { x: input, y: a };
+    const a = this.hp90 * (this.hp90Y + input - this.hp90X);
+    this.hp90X = input;
+    this.hp90Y = a;
 
     let b = a;
     if (this.consoleBass) {
-      b = this.hp440 * (this.hp440Prev.y + a - this.hp440Prev.x);
-      this.hp440Prev = { x: a, y: b };
+      b = this.hp440 * (this.hp440Y + a - this.hp440X);
+      this.hp440X = a;
+      this.hp440Y = b;
     }
 
     this.lowPrev += this.low * (b - this.lowPrev);

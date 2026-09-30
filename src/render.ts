@@ -7,7 +7,7 @@
  */
 
 import { Apu } from './chip.js';
-import { mixApu, OutputFilters } from './mixer.js';
+import { mixApu, OutputFilters, PULSE_MIX, TRIANGLE_MIX } from './mixer.js';
 
 /** One CPU write to an APU register, at a moment in seconds from the start. */
 export interface RegisterWrite {
@@ -64,8 +64,6 @@ export interface Render {
   peak: number;
 }
 
-const clamp = (value: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, value));
-
 /**
  * Play `writes` through the chip for `duration` seconds.
  *
@@ -100,54 +98,79 @@ export function renderWrites(
   const clickLength = Math.round(rate * 0.03);
   let clickCursor = 0;
 
+  // Work in blocks: the chip fills a run of samples per channel, then one tight
+  // loop mixes, filters and decimates it. A block ends early at the next write,
+  // which has to land on its own sample.
+  const BLOCK = 1024;
+  const p1 = new Uint8Array(BLOCK);
+  const p2 = new Uint8Array(BLOCK);
+  const tri = new Uint8Array(BLOCK);
+  const noise = new Float64Array(BLOCK);
+  const hasClicks = clicks.length > 0;
+  const f0 = faders ? (faders[0] ?? 1) : 1;
+  const f1 = faders ? (faders[1] ?? 1) : 1;
+  const f2 = faders ? (faders[2] ?? 1) : 1;
+  const f3 = faders ? (faders[3] ?? 1) : 1;
+
   let next = 0;
   let peak = 0;
   let accumulator = 0;
   let written = 0;
+  let phase = 0;
 
-  for (let sample = 0; sample < total; sample++) {
+  for (let sample = 0; sample < total; ) {
     while (next < ordered.length && ordered[next].at <= sample) {
       const { write } = ordered[next++];
       chip.write(write.address, write.value);
     }
+    const until = next < ordered.length ? ordered[next].at : total;
+    const count = Math.min(BLOCK, total - sample, until - sample);
+    chip.render(count, p1, p2, tri, noise, 0);
 
-    const levels = chip.levels();
-    const mixed = faders
-      ? mixApu(
-          levels[0] * (faders[0] ?? 1),
-          levels[1] * (faders[1] ?? 1),
-          levels[2] * (faders[2] ?? 1),
-          levels[3] * (faders[3] ?? 1)
-        )
-      : mixApu(levels[0], levels[1], levels[2], levels[3]);
-    // Filtered at the oversampled rate: the low-pass then doubles as the
-    // anti-aliasing filter the decimation needs.
-    let value = filtered ? filters.step(mixed) : mixed;
+    for (let k = 0; k < count; k++, sample++) {
+      let mixed: number;
+      if (faders) {
+        mixed = mixApu(p1[k] * f0, p2[k] * f1, tri[k] * f2, noise[k] * f3);
+      } else if (noise[k] === 0) {
+        // The common case, from tables built with the mixer's own expressions.
+        mixed = PULSE_MIX[p1[k] + p2[k]] + TRIANGLE_MIX[tri[k]];
+      } else {
+        const tnd = tri[k] / 8227 + noise[k] / 12241;
+        mixed = PULSE_MIX[p1[k] + p2[k]] + (tnd === 0 ? 0 : 159.79 / (1 / tnd + 100));
+      }
+      // Filtered at the oversampled rate: the low-pass then doubles as the
+      // anti-aliasing filter the decimation needs.
+      let value = filtered ? filters.step(mixed) : mixed;
 
-    while (clickCursor < clicks.length && sample >= clicks[clickCursor].at + clickLength) {
-      clickCursor++;
-    }
-    const click = clicks[clickCursor];
-    if (click && sample >= click.at) {
-      // A decaying sine, added AFTER the console's filters: running it through
-      // them would colour it as if it came out of the cartridge.
-      const into = (sample - click.at) / clickLength;
-      const hz = click.strong ? 1600 : 1050;
-      value +=
-        Math.sin((2 * Math.PI * hz * (sample - click.at)) / rate) *
-        Math.pow(1 - into, 3) *
-        (click.strong ? 0.22 : 0.14);
-    }
+      if (hasClicks) {
+        while (clickCursor < clicks.length && sample >= clicks[clickCursor].at + clickLength) {
+          clickCursor++;
+        }
+        const click = clicks[clickCursor];
+        if (click && sample >= click.at) {
+          // A decaying sine, added AFTER the console's filters: running it
+          // through them would colour it as if it came out of the cartridge.
+          const into = (sample - click.at) / clickLength;
+          const hz = click.strong ? 1600 : 1050;
+          value +=
+            Math.sin((2 * Math.PI * hz * (sample - click.at)) / rate) *
+            Math.pow(1 - into, 3) *
+            (click.strong ? 0.22 : 0.14);
+        }
+      }
 
-    accumulator += value;
+      accumulator += value;
 
-    if ((sample + 1) % oversample === 0) {
-      // Clamped, not scaled: the filters can overshoot a little on a hard
-      // transient. `peak` reports what it was BEFORE the clamp.
-      const averaged = (accumulator / oversample) * gain;
-      accumulator = 0;
-      if (Math.abs(averaged) > peak) peak = Math.abs(averaged);
-      if (written < out.length) out[written++] = clamp(averaged, -1, 1);
+      if (++phase === oversample) {
+        phase = 0;
+        // Clamped, not scaled: the filters can overshoot a little on a hard
+        // transient. `peak` reports what it was BEFORE the clamp.
+        const averaged = (accumulator / oversample) * gain;
+        accumulator = 0;
+        const magnitude = averaged < 0 ? -averaged : averaged;
+        if (magnitude > peak) peak = magnitude;
+        if (written < out.length) out[written++] = averaged > 1 ? 1 : averaged < -1 ? -1 : averaged;
+      }
     }
   }
 
