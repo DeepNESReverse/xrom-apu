@@ -213,3 +213,22 @@ describe('speed-ups that must not change a sample', () => {
     expect(LONG_HIGH_BEFORE[LONG_CYCLE]).toBe(high);
   });
 });
+
+describe('snapshot', () => {
+  it('reports the counters a note sets, and the sweep mute', async () => {
+    const { Apu } = await import('../src/index.js');
+    const chip = new Apu(44100);
+    chip.write(0x4015, 0x05);
+    chip.write(0x4000, 0x9a); // duty 2, counter running, constant volume 10
+    chip.write(0x4002, 0x00);
+    chip.write(0x4003, (5 << 3) | 0x05); // length index 5 → 4, period $500
+    chip.write(0x4008, 0x7f);
+    chip.write(0x400b, 1 << 3); // length index 1 → 254
+    const s = chip.snapshot();
+    expect(s.pulse[0]).toMatchObject({ period: 0x500, duty: 2, length: 4, level: 10, enabled: true });
+    // $4001 still at its power-on 0: a period of $500 is muted by the sweep unit.
+    expect(s.pulse[0].muted).toBe(true);
+    expect(s.pulse[1].enabled).toBe(false);
+    expect(s.triangle).toMatchObject({ length: 254, enabled: true });
+  });
+});

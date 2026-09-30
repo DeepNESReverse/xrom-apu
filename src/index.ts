@@ -21,7 +21,7 @@ export {
   QUARTER_FRAME_HZ,
   TRIANGLE_STEPS,
 } from './constants.js';
-export { Apu, type ApuChipOptions } from './chip.js';
+export { Apu, type ApuChipOptions, type ApuSnapshot } from './chip.js';
 export { mixApu, OutputFilters } from './mixer.js';
 export {
   SWEEP_HZ,

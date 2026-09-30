@@ -106,6 +106,42 @@ interface Noise {
   step: number;
 }
 
+/**
+ * What the chip is doing right now, channel by channel — for showing it, not
+ * for driving it. Every field is a number the hardware itself holds.
+ */
+export interface ApuSnapshot {
+  pulse: {
+    period: number;
+    duty: number;
+    /** Length counter, in half-frames; 0 is silent. */
+    length: number;
+    /** Level the channel outputs when high: the written volume, or the envelope's decay. */
+    level: number;
+    constant: boolean;
+    /** The sweep unit is muting the channel (period < 8, or target past $7FF). */
+    muted: boolean;
+    enabled: boolean;
+  }[];
+  triangle: {
+    period: number;
+    length: number;
+    /** Linear counter, in quarter-frames; 0 is silent. */
+    linear: number;
+    /** The step the staircase is on — held while silent. */
+    step: number;
+    enabled: boolean;
+  };
+  noise: {
+    periodIndex: number;
+    shortMode: boolean;
+    length: number;
+    level: number;
+    constant: boolean;
+    enabled: boolean;
+  };
+}
+
 export interface ApuChipOptions {
   /**
    * Honour the length counters. Default true — it is hardware, and without it
@@ -478,6 +514,38 @@ export class Apu {
       n.lfsr = lfsr;
     }
     n.phase = phase;
+  }
+
+  /** A copy of the channels' internal counters and levels — see `ApuSnapshot`. */
+  snapshot(): ApuSnapshot {
+    const t = this.triangle;
+    const n = this.noise;
+    return {
+      pulse: this.pulses.map((p) => ({
+        period: p.period,
+        duty: p.duty,
+        length: p.length,
+        level: p.constant ? p.volume : p.env.decay,
+        constant: p.constant,
+        muted: p.muted,
+        enabled: p.enabled,
+      })),
+      triangle: {
+        period: t.period,
+        length: t.length,
+        linear: t.linear,
+        step: TRIANGLE_FLAT[(t.phase | 0) & 31],
+        enabled: t.enabled,
+      },
+      noise: {
+        periodIndex: n.periodIndex,
+        shortMode: n.shortMode,
+        length: n.length,
+        level: n.constant ? n.volume : n.env.decay,
+        constant: n.constant,
+        enabled: n.enabled,
+      },
+    };
   }
 
   private retunePulse(p: Pulse) {
