@@ -1,4 +1,6 @@
-# xrom-apu
+# @xromdev/apu
+
+[![npm](https://img.shields.io/npm/v/@xromdev/apu)](https://www.npmjs.com/package/@xromdev/apu) [![test](https://github.com/DeepNESReverse/xrom-apu/actions/workflows/test.yml/badge.svg)](https://github.com/DeepNESReverse/xrom-apu/actions/workflows/test.yml) ![size](https://img.shields.io/bundlephobia/minzip/@xromdev/apu)
 
 The NES sound chip — the 2A03's APU — in TypeScript. **Register writes in, samples out.**
 
@@ -22,7 +24,7 @@ they come out.
 ## Install
 
 ```sh
-npm install github:DeepNESReverse/xrom-apu
+npm install @xromdev/apu
 ```
 
 ## Two ways in
@@ -32,7 +34,7 @@ npm install github:DeepNESReverse/xrom-apu
 What a driver writes, with a time in seconds:
 
 ```ts
-import { renderWrites } from 'xrom-apu';
+import { renderWrites } from '@xromdev/apu';
 
 const { samples, sampleRate } = renderWrites(
   [
@@ -58,7 +60,7 @@ part — it writes what a driver would have written to sound them, and renders
 that:
 
 ```ts
-import { renderNotes, type PitchedRow } from 'xrom-apu';
+import { renderNotes, type PitchedRow } from '@xromdev/apu';
 
 // [midi, startTick, ticks, channel, volume, period, duty, volumeEnd, lengthTicks, bendIndex]
 const melody: PitchedRow[] = [
@@ -78,7 +80,7 @@ Write to it as the CPU does, and pull a block of samples whenever the audio
 side wants one:
 
 ```ts
-import { Apu, mixApu, OutputFilters } from 'xrom-apu';
+import { Apu, mixApu, OutputFilters } from '@xromdev/apu';
 
 const rate = 48000;
 const chip = new Apu(rate);

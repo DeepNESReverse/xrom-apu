@@ -1,5 +1,5 @@
 {
-  "name": "xrom-apu",
+  "name": "@xromdev/apu",
   "version": "0.1.0",
   "description": "The NES sound chip (2A03 APU) in TypeScript: register writes in, samples out.",
   "license": "MIT",
@@ -51,5 +51,8 @@
     "typescript": "^5.9.3",
     "vitest": "^3.2.7"
   },
-  "author": "Oleksandr Maksymov"
+  "author": "Oleksandr Maksymov",
+  "publishConfig": {
+    "access": "public"
+  }
 }
