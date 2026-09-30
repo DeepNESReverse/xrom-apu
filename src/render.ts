@@ -7,7 +7,7 @@
  */
 
 import { Apu, type ApuMemory, type ChannelBuffers } from './chip.js';
-import { mixApu, OutputFilters, PULSE_MIX, TRIANGLE_MIX } from './mixer.js';
+import { mixApu, OutputFilters, PULSE_MIX, PULSE_TRIANGLE_MIX } from './mixer.js';
 
 /** One CPU write to an APU register, at a moment in seconds from the start. */
 export interface RegisterWrite {
@@ -140,7 +140,7 @@ export function renderWrites(
         mixed = mixApu(p1[k] * f0, p2[k] * f1, tri[k] * f2, noise[k] * f3, dmc[k] * f4);
       } else if (noise[k] === 0 && dmc[k] === 0) {
         // The common case, from tables built with the mixer's own expressions.
-        mixed = PULSE_MIX[p1[k] + p2[k]] + TRIANGLE_MIX[tri[k]];
+        mixed = PULSE_TRIANGLE_MIX[((p1[k] + p2[k]) << 4) | tri[k]];
       } else {
         const tnd = tri[k] / 8227 + noise[k] / 12241 + dmc[k] / 22638;
         mixed = PULSE_MIX[p1[k] + p2[k]] + (tnd === 0 ? 0 : 159.79 / (1 / tnd + 100));

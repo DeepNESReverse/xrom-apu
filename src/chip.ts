@@ -575,9 +575,13 @@ export class Apu {
         // Silent, but the register keeps shifting: advance it, output nothing.
         for (let k = at; k < end; k++) {
           phase += step;
+          // A few shifts per sample at most, so one conditional subtraction
+          // wraps the index — no division. (Math.floor, not `| 0`: the phase is
+          // a double, and a round trip through int32 measured 20% slower.)
           const shifts = Math.floor(phase);
           phase -= shifts;
-          if (shifts > 0) index = (index + shifts) % LONG_CYCLE;
+          index += shifts;
+          if (index >= LONG_CYCLE) index -= LONG_CYCLE;
         }
         noise.fill(0, at, end);
       } else {
@@ -588,7 +592,8 @@ export class Apu {
           let gate: number;
           if (shifts > 0) {
             gate = (LONG_HIGH_BEFORE[index + shifts] - LONG_HIGH_BEFORE[index]) / shifts;
-            index = (index + shifts) % LONG_CYCLE;
+            index += shifts;
+            if (index >= LONG_CYCLE) index -= LONG_CYCLE;
           } else {
             gate = (LONG_STATES[index] & 1) === 0 ? 1 : 0;
           }

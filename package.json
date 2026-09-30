@@ -1,6 +1,6 @@
 {
   "name": "@xromdev/apu",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "The NES sound chip (2A03 APU) in TypeScript: register writes in, samples out.",
   "license": "MIT",
   "type": "module",

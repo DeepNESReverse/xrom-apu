@@ -101,3 +101,10 @@ export class OutputFilters {
     return this.lowPrev;
   }
 }
+
+/**
+ * `PULSE_MIX[pulses] + TRIANGLE_MIX[triangle]`, added up in advance: one
+ * lookup at `(pulses << 4) | triangle` for the renderer's commonest case —
+ * the same addition, so the same floats.
+ */
+export const PULSE_TRIANGLE_MIX = Float64Array.from({ length: 31 * 16 }, (_, i) => PULSE_MIX[i >> 4] + TRIANGLE_MIX[i & 15]);
