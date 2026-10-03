@@ -5,6 +5,8 @@ import {
   NOISE_PERIODS,
   bendAt,
   mixApu,
+  notesToWrites,
+  renderNotes,
   renderNotes as renderApu,
   type BendCurve,
   type DrumRow,
@@ -570,5 +572,50 @@ describe("the chip's own envelope", () => {
   it('leaves constant-volume notes to the driver', () => {
     const steady = render([4, 0, 4, 9, 9, 0, -1]);
     expect(peakIn(steady.samples, steady.sampleRate, 3, 4)).toBeGreaterThan(0);
+  });
+});
+
+describe('DMC hits', () => {
+  // A sample of 17 bytes of alternating deltas at $C000: loud enough to hear, short enough to end.
+  const sample = { address: 0xc000, bytes: Array.from({ length: 17 }, (_, i) => (i % 2 ? 0x00 : 0xff)) };
+  const input = {
+    pitched: [[48, 0, 8, 2, 12, 300, 0, 12, 0, -1]] as const,
+    drums: [],
+    hits: [[0, 2, 8, 15, 0]] as const,
+    samples: [sample],
+    secondsPerTick: 0.05,
+    totalTicks: 16,
+  };
+
+  it('points the DMC at the sample and starts it', () => {
+    const writes = notesToWrites(input as never);
+    const at = (address: number) => writes.filter((w) => w.address === address).map((w) => w.value);
+    expect(at(0x4010)).toEqual([0x0f]);
+    expect(at(0x4012)).toEqual([0]);
+    expect(at(0x4013)).toEqual([1]);
+    expect(at(0x4015).some((v) => (v & 0x10) !== 0)).toBe(true);
+  });
+
+  it('keeps the sample playing through the triangle switching off', () => {
+    // 161 bytes at the slowest rate read for 0.31 s: struck at tick 7 (0.35 s), still reading
+    // when the triangle ends at tick 8 (0.4 s).
+    const long = { address: 0xc000, bytes: Array.from({ length: 161 }, (_, i) => (i % 2 ? 0x00 : 0xff)) };
+    const writes = notesToWrites({ ...input, samples: [long], hits: [[0, 7, 8, 0, 0]] } as never);
+    const off = writes.filter((w) => w.address === 0x4015 && Math.abs(w.time - 0.4) < 1e-9);
+    expect(off.length).toBeGreaterThan(0);
+    expect(off.every((w) => (w.value & 0x10) !== 0)).toBe(true);
+  });
+
+  it('does not restart a sample that has ended when the triangle switches off', () => {
+    const writes = notesToWrites({ ...input, hits: [[0, 7, 8, 0, 0]] } as never);
+    const off = writes.filter((w) => w.address === 0x4015 && Math.abs(w.time - 0.4) < 1e-9);
+    expect(off.every((w) => (w.value & 0x10) === 0)).toBe(true);
+  });
+
+  it('is heard: the DMC output moves', () => {
+    const on = renderNotes(input as never, { sampleRate: 22050, voiceLevels: [0, 0, 0, 0, 1] });
+    const off = renderNotes({ ...input, hits: [] } as never, { sampleRate: 22050, voiceLevels: [0, 0, 0, 0, 1] });
+    const energy = (s: Float32Array) => s.reduce((sum, v) => sum + v * v, 0);
+    expect(energy(on.samples)).toBeGreaterThan(energy(off.samples) * 10 + 1e-6);
   });
 });

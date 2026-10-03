@@ -24,7 +24,7 @@
  *    same moment.
  */
 
-import { FRAME_HZ, LENGTH_TABLE } from './constants.js';
+import { CPU_HZ, DMC_PERIODS, FRAME_HZ, LENGTH_TABLE } from './constants.js';
 import { renderWrites, type Click, type RegisterWrite, type RenderOptions } from './render.js';
 
 /**
@@ -59,9 +59,30 @@ export type BendCurve = readonly (readonly [number, number])[];
  */
 export type DrumRow = readonly [number, number, number, number, number, number, number?];
 
+/**
+ * `[sampleIndex, startTick, durationTicks, rate, loop]` — a sample struck on the
+ * DMC: `sampleIndex` into `ApuInput.samples`, `rate` the low nibble of `$4010`,
+ * `loop` 1 to repeat it until the row ends. It plays to the end of its bytes or
+ * of the row, whichever comes first.
+ */
+export type SampleRow = readonly [number, number, number, number, number];
+
+/**
+ * A DMC sample: the 1-bit delta bytes the channel reads, and where it reads them
+ * — `$C000` + 64·n, as `$4012` can point. The bytes are the cartridge's own.
+ */
+export interface DmcSample {
+  address: number;
+  bytes: readonly number[] | Uint8Array;
+}
+
 export interface ApuInput {
   pitched: readonly PitchedRow[];
   drums: readonly DrumRow[];
+  /** Samples struck on the DMC, pointing into `samples`. */
+  hits?: readonly SampleRow[];
+  /** The samples the hits play. */
+  samples?: readonly DmcSample[];
   /** Pitch curves the notes point at. Shared, because the shapes repeat. */
   bends?: readonly BendCurve[];
   /** Seconds per tick. */
@@ -181,6 +202,29 @@ const LONGEST = 1;
 
 /** The `$4015` value: pulses and noise always on; the triangle toggled to end its notes. */
 const enables = (triangle: boolean) => 0x0b | (triangle ? 0x04 : 0);
+
+/** Seconds a sample of `length` bytes takes at `$4010` rate `rate`. */
+export const sampleSeconds = (length: number, rate: number) =>
+  (length * 8 * DMC_PERIODS[rate & 0x0f]) / CPU_HZ;
+
+/**
+ * The bytes `$4013` makes the DMC read: 16·n + 1. A sample is stored that long;
+ * one that is not is read to the next length the register can say.
+ */
+const lengthCode = (bytes: number) => Math.max(0, Math.min(255, Math.ceil((bytes - 1) / 16)));
+
+/**
+ * The cartridge memory the DMC reads, from the samples a piece holds: each laid
+ * at its own address, the rest zero. For `renderWrites`' `memory`.
+ */
+export function sampleMemory(samples: readonly DmcSample[]): Uint8Array {
+  const memory = new Uint8Array(0x8000);
+  for (const sample of samples) {
+    const at = sample.address - 0x8000;
+    for (let i = 0; i < sample.bytes.length && at + i < memory.length; i++) memory[at + i] = sample.bytes[i];
+  }
+  return memory;
+}
 
 /** A register value can only hold whole numbers; a period outside 11 bits is not one the chip has. */
 const toPeriod = (value: number) => Math.min(0x7ff, Math.max(0, Math.round(value)));
@@ -315,6 +359,28 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
     });
   }
 
+  /*
+   * The DMC's hits, worked out first: `$4015` is one register, and the triangle's
+   * on/off writes to it clear the DMC's bit unless they set it — which stops a
+   * sample dead. So every `$4015` write carries bit 4 while a sample is still
+   * playing, and only then: set after it has ended, the bit starts it again.
+   */
+  const samples = input.samples ?? [];
+  const hits = (input.hits ?? [])
+    .map((row) => {
+      const sample = samples[row[0]];
+      if (!sample) return null;
+      const start = lead + at(row[1]);
+      const rowEnd = lead + at(row[1] + row[2]);
+      const length = lengthCode(sample.bytes.length) * 16 + 1;
+      const end = row[4] ? rowEnd : Math.min(rowEnd, start + sampleSeconds(length, row[3]));
+      return end > start ? { row, sample, start, end, length } : null;
+    })
+    .filter((hit) => hit !== null)
+    .sort((a, b) => a.start - b.start);
+  const sampleOn = (time: number) => hits.some((hit) => hit.start <= time && time < hit.end);
+  const withSample = (value: number, time: number) => (sampleOn(time) ? value | 0x10 : value);
+
   // Triangle. No volume: it is ended by switching it off in `$4015`, the one
   // way to stop it on the spot — and it then holds whatever step it stopped on.
   {
@@ -328,7 +394,7 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
       // counter is the one that ends the note; with none, the control bit set
       // halts both.
       const load = lengthTicks > 0 ? lengthIndex(lengthTicks) : 0;
-      if (!on) put(voice.start, 0x4015, enables(true));
+      if (!on) put(voice.start, 0x4015, withSample(enables(true), voice.start));
       on = true;
       put(voice.start, 0x4008, lengthTicks > 0 ? 0x7f : 0xff);
       put(voice.start, 0x400a, period & 0xff);
@@ -349,7 +415,7 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
 
       const next = voices[i + 1];
       if (!next || next.start > voice.end + 1e-9) {
-        put(voice.end, 0x4015, enables(false));
+        put(voice.end, 0x4015, withSample(enables(false), voice.end));
         on = false;
       }
     });
@@ -384,6 +450,30 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
     });
   }
 
+  // The DMC: rate and loop, where the sample is and how long, then bit 4 of
+  // `$4015` to start it. A hit cut short by its row — or by the next — is
+  // stopped by clearing the bit. The triangle's own `$4015` state goes with it.
+  hits.forEach((hit, i) => {
+    const [, , , rate, loop] = hit.row;
+    const triangleOn = (time: number) => {
+      // The last word the triangle had on `$4015` before `time`: on unless it was switched off.
+      let state = true;
+      for (const w of writes) if (w.address === 0x4015 && w.time <= time) state = (w.value & 0x04) !== 0;
+      return state;
+    };
+    put(hit.start, 0x4010, (loop ? 0x40 : 0) | (rate & 0x0f));
+    put(hit.start, 0x4012, ((hit.sample.address - 0xc000) >> 6) & 0xff);
+    put(hit.start, 0x4013, lengthCode(hit.sample.bytes.length));
+    // Off and on: bit 4 set while the last sample is still reading does not restart it.
+    put(hit.start, 0x4015, enables(triangleOn(hit.start)));
+    put(hit.start, 0x4015, enables(triangleOn(hit.start)) | 0x10);
+    const next = hits[i + 1];
+    const natural = hit.start + sampleSeconds(hit.length, rate);
+    if (hit.end < natural - 1e-9 && (!next || next.start > hit.end + 1e-9)) {
+      put(hit.end, 0x4015, enables(triangleOn(hit.end)));
+    }
+  });
+
   return writes;
 }
 
@@ -404,6 +494,7 @@ export function renderNotes(input: ApuInput, options: ApuOptions = {}): ApuRende
   const result = renderWrites(notesToWrites(input, lead), lead + end, {
     ...render,
     clicks,
+    ...(input.samples?.length && !render.memory ? { memory: sampleMemory(input.samples) } : {}),
   });
 
   return {
