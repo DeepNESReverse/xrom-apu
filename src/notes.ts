@@ -60,12 +60,14 @@ export type BendCurve = readonly (readonly [number, number])[];
 export type DrumRow = readonly [number, number, number, number, number, number, number?];
 
 /**
- * `[sampleIndex, startTick, durationTicks, rate, loop]` — a sample struck on the
- * DMC: `sampleIndex` into `ApuInput.samples`, `rate` the low nibble of `$4010`,
- * `loop` 1 to repeat it until the row ends. It plays to the end of its bytes or
- * of the row, whichever comes first.
+ * `[sampleIndex, startTick, durationTicks, rate, loop, level]` — a sample struck
+ * on the DMC: `sampleIndex` into `ApuInput.samples`, `rate` the low nibble of
+ * `$4010`, `loop` 1 to repeat it until the row ends, `level` the 7-bit value a
+ * driver loads into `$4011` before it (the jump is part of the sound — a kick's
+ * thump), or -1/absent for none. It plays to the end of its bytes or of the
+ * row, whichever comes first.
  */
-export type SampleRow = readonly [number, number, number, number, number];
+export type SampleRow = readonly [number, number, number, number, number, number?];
 
 /**
  * A DMC sample: the 1-bit delta bytes the channel reads, and where it reads them
@@ -454,7 +456,7 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
   // `$4015` to start it. A hit cut short by its row — or by the next — is
   // stopped by clearing the bit. The triangle's own `$4015` state goes with it.
   hits.forEach((hit, i) => {
-    const [, , , rate, loop] = hit.row;
+    const [, , , rate, loop, level] = hit.row;
     const triangleOn = (time: number) => {
       // The last word the triangle had on `$4015` before `time`: on unless it was switched off.
       let state = true;
@@ -462,6 +464,7 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
       return state;
     };
     put(hit.start, 0x4010, (loop ? 0x40 : 0) | (rate & 0x0f));
+    if (level !== undefined && level >= 0) put(hit.start, 0x4011, level & 0x7f);
     put(hit.start, 0x4012, ((hit.sample.address - 0xc000) >> 6) & 0xff);
     put(hit.start, 0x4013, lengthCode(hit.sample.bytes.length));
     // Off and on: bit 4 set while the last sample is still reading does not restart it.

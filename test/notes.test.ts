@@ -619,3 +619,19 @@ describe('DMC hits', () => {
     expect(energy(on.samples)).toBeGreaterThan(energy(off.samples) * 10 + 1e-6);
   });
 });
+
+describe('DMC hit level', () => {
+  it('loads $4011 before the sample when the row has a level, and not when it has none', () => {
+    const base = {
+      pitched: [],
+      drums: [],
+      samples: [{ address: 0xc000, bytes: [0xff] }],
+      secondsPerTick: 0.05,
+      totalTicks: 8,
+    };
+    const with11 = notesToWrites({ ...base, hits: [[0, 0, 4, 15, 0, 0x2f]] } as never);
+    const without = notesToWrites({ ...base, hits: [[0, 0, 4, 15, 0]] } as never);
+    expect(with11.filter((w) => w.address === 0x4011).map((w) => w.value)).toEqual([0x2f]);
+    expect(without.some((w) => w.address === 0x4011)).toBe(false);
+  });
+});
