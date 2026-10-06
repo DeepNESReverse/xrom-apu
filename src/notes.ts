@@ -74,9 +74,10 @@ export type BendCurve = readonly (readonly [number, number])[];
 
 /**
  * `[periodIndex, startTick, durationTicks, volume, volumeEnd, lengthTicks,
- * envelope]` — a noise-channel note. `periodIndex` is the low nibble of `$400E`.
+ * envelope, levelIndex]` — a noise-channel note. `periodIndex` is the low nibble of `$400E`;
+ * `levelIndex` points into `ApuInput.levels`, as a pulse row's does, or is -1/absent.
  */
-export type DrumRow = readonly [number, number, number, number, number, number, number?];
+export type DrumRow = readonly [number, number, number, number, number, number, number?, number?];
 
 /**
  * `[sampleIndex, startTick, durationTicks, rate, loop, level]` — a sample struck
@@ -106,7 +107,7 @@ export interface ApuInput {
   samples?: readonly DmcSample[];
   /** Pitch curves the notes point at. Shared, because the shapes repeat. */
   bends?: readonly BendCurve[];
-  /** Level curves the pulse notes point at — see `PitchedRow`'s `levelIndex`. Shared like `bends`. */
+  /** Level curves the pulse and noise notes point at — see `PitchedRow`'s `levelIndex`. Shared like `bends`. */
   levels?: readonly LevelCurve[];
   /** Seconds per tick. */
   secondsPerTick: number;
@@ -452,18 +453,23 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
   {
     const voices: Voice[] = voicesOf(input.drums, (() => true) as (row: never) => boolean);
     voices.forEach((voice, i) => {
-      const [periodIndex, , , volume, volumeEnd, lengthTicks, envelope] = voice.row as DrumRow;
+      const [periodIndex, , , volume, volumeEnd, lengthTicks, envelope, levelIndex] = voice.row as DrumRow;
       const bits = controlBits(envelope ?? -1, lengthTicks);
       const reg = (level: number) =>
         (bits.halt ? 0x20 : 0) | (bits.constant ? 0x10 | (level & 0x0f) : bits.low);
+      // A drum struck at 8 and dropped to 2 the next frame — Darkwing Duck's — is that curve, not a line.
+      const levelCurve =
+        levelIndex !== undefined && levelIndex >= 0 ? (input.levels?.[levelIndex] ?? null) : null;
       const level = (at: number) =>
-        Math.min(15, Math.max(0, Math.round(volume + (volumeEnd - volume) * at)));
+        levelCurve
+          ? Math.min(15, Math.max(0, levelAt(levelCurve, at)))
+          : Math.min(15, Math.max(0, Math.round(volume + (volumeEnd - volume) * at)));
 
       put(voice.start, 0x400c, reg(level(0)));
       put(voice.start, 0x400e, periodIndex & 0x0f);
       put(voice.start, 0x400f, bits.load << 3);
 
-      if (bits.constant && volume !== volumeEnd) {
+      if (bits.constant && (levelCurve !== null || volume !== volumeEnd)) {
         let last = level(0);
         for (const { time, position } of frames(voice.start, voice.end)) {
           const now = level(position);
