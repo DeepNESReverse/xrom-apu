@@ -29,11 +29,13 @@ import { renderWrites, type Click, type RegisterWrite, type RenderOptions } from
 
 /**
  * `[midi, startTick, durationTicks, channel 0..2, volume, period, duty,
- * volumeEnd, lengthTicks, bendIndex, envelope, sweep]` — `lengthTicks` counts at
+ * volumeEnd, lengthTicks, bendIndex, envelope, sweep, levelIndex]` — `lengthTicks` counts at
  * 120 Hz and 0 means unlimited; `bendIndex` points into `ApuInput.bends`, or is
  * -1; `envelope` is the low five bits of `$4000` when the chip's own envelope
  * runs (period, and bit 4 for loop), or -1 for constant volume; `sweep` is the
- * `$4001` byte, or -1/absent when the data has none.
+ * `$4001` byte, or -1/absent when the data has none; `levelIndex`, on a pulse, points into
+ * `ApuInput.levels` for a level that does not go in a straight line from `volume` to `volumeEnd`,
+ * or is -1/absent.
  */
 export type PitchedRow = readonly [
   number,
@@ -48,7 +50,24 @@ export type PitchedRow = readonly [
   number,
   number?,
   number?,
+  number?,
 ];
+
+/**
+ * A level curve: `[position 0..1, level 0..15]` at each change of level, in order. The level holds
+ * from one point to the next — a driver writes whole levels, a frame at a time.
+ */
+export type LevelCurve = readonly (readonly [number, number])[];
+
+/** The level a curve holds at `position`: the last point at or before it. */
+export function levelAt(curve: LevelCurve, position: number): number {
+  let level = curve[0]?.[1] ?? 0;
+  for (const [at, value] of curve) {
+    if (at > position + 1e-9) break;
+    level = value;
+  }
+  return level;
+}
 
 /** A pitch curve: `[position 0..1, semitones]`, in order. */
 export type BendCurve = readonly (readonly [number, number])[];
@@ -87,6 +106,8 @@ export interface ApuInput {
   samples?: readonly DmcSample[];
   /** Pitch curves the notes point at. Shared, because the shapes repeat. */
   bends?: readonly BendCurve[];
+  /** Level curves the pulse notes point at — see `PitchedRow`'s `levelIndex`. Shared like `bends`. */
+  levels?: readonly LevelCurve[];
   /** Seconds per tick. */
   secondsPerTick: number;
   /** Length of the piece in ticks. */
@@ -315,15 +336,19 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
       ((row: PitchedRow) => row[3] === channel && row[5] >= 1) as (row: never) => boolean
     );
     voices.forEach((voice, i) => {
-      const [, , , , volume, period, duty, volumeEnd, lengthTicks, bendIndex, envelope, sweep] =
+      const [, , , , volume, period, duty, volumeEnd, lengthTicks, bendIndex, envelope, sweep, levelIndex] =
         voice.row as PitchedRow;
+      const levelCurve =
+        levelIndex !== undefined && levelIndex >= 0 ? (input.levels?.[levelIndex] ?? null) : null;
       const bits = controlBits(envelope ?? -1, lengthTicks);
       const reg0 = (level: number) =>
         ((duty & 3) << 6) |
         (bits.halt ? 0x20 : 0) |
         (bits.constant ? 0x10 | (level & 0x0f) : bits.low);
       const level = (at: number) =>
-        Math.min(15, Math.max(0, Math.round(volume + (volumeEnd - volume) * at)));
+        levelCurve
+          ? Math.min(15, Math.max(0, levelAt(levelCurve, at)))
+          : Math.min(15, Math.max(0, Math.round(volume + (volumeEnd - volume) * at)));
 
       put(voice.start, base, reg0(level(0)));
       put(voice.start, base + 1, sweep !== undefined && sweep >= 0 ? sweep : 0x08);
@@ -331,7 +356,7 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
       put(voice.start, base + 3, (bits.load << 3) | ((period >> 8) & 7));
 
       const curve = bendIndex >= 0 ? (bends[bendIndex] ?? null) : null;
-      const ramps = bits.constant && volume !== volumeEnd;
+      const ramps = bits.constant && (levelCurve !== null || volume !== volumeEnd);
       if (curve || ramps) {
         let lastLevel = level(0);
         let lastPeriod = period;

@@ -47,6 +47,7 @@ export {
 } from './render.js';
 export {
   bendAt,
+  levelAt,
   notesToWrites,
   renderNotes,
   sampleMemory,
@@ -57,6 +58,7 @@ export {
   type ApuOptions,
   type ApuRender,
   type BendCurve,
+  type LevelCurve,
   type DrumRow,
   type PitchedRow,
   secondsToTick,
