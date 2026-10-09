@@ -79,6 +79,20 @@ that long — and notes, loop points and the metronome follow them.
 `tickToSeconds(input, tick)` and `secondsToTick` convert for anything drawn
 alongside.
 
+Samples struck on the DMC — a kick, a snare, a voice — go in `hits`, each
+`[sampleIndex, startTick, ticks, rate, loop, level]`, with the bytes they play in
+`samples` as `{ address, bytes }`. `level` is the value the driver loads into
+`$4011` just before the hit, or -1 for none: that jump is part of the sound, the
+thump of a kick. The chip reads the bytes from where they sit in cartridge
+memory; `sampleMemory(samples)` lays them out there for a `memory` option of
+your own.
+
+A note whose level does not go in a straight line from `volume` to `volumeEnd`
+— a driver that steps it frame by frame — points into `levels` with its last
+field, `levelIndex`. A curve is `[position 0..1, level 0..15]` at each change,
+and holds from one point to the next, as a driver writes whole levels a frame at
+a time. Pulse and noise notes take them; `levelAt(curve, position)` reads one.
+
 `notesToWrites` gives you the writes on their own, if you want to see them.
 
 ### Live
@@ -226,6 +240,8 @@ test suite checks the fast paths against the plain ones bit for bit.
 | `renderWrites(writes, seconds, options?)` | Register writes → `{ samples, sampleRate, duration, peak }`. |
 | `renderNotes(input, options?)` / `notesToWrites(input)` | Decoded notes → samples, or → the writes a driver would make. |
 | `tickToSeconds(input, tick)` / `secondsToTick(input, s)` | Ticks ↔ seconds through the input's `tempo` changes. |
+| `sampleMemory(samples)` | DMC samples laid out where the chip reads them — cartridge memory for the `memory` option. |
+| `levelAt(curve, position)` | The level a note's level curve holds at a point of the note. |
 | `new Apu(sampleRate, { memory?, lengthCounter? })` | The chip itself: `write(address, value)`, `render(count, buffers)`, `levels()`, `snapshot()`. |
 | `mixApu(p1, p2, tri, noise, dmc?)`, `OutputFilters` | The non-linear mixer and the console's analogue stage, for use with `Apu`. |
 | `sweepTrace(period, sweep, channel, halfFrames)` | The period the sweep unit plays, half-frame by half-frame — for drawing a swept sound. |
