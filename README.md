@@ -15,6 +15,11 @@ they come out. **Try it live in the browser:
 [xrom.dev/utils/apu](https://xrom.dev/utils/apu).**
 
 - All five channels: two pulses, the triangle, noise and the DMC (samples).
+- Two Famicom expansion chips, when a game has them: the Disk System's wavetable
+  voice (FDS, `$4040`–`$408A`) and Namco's 163 (up to eight wavetable channels,
+  through its ports at `$F800`/`$4800`). `renderWrites` turns them on when the
+  writes talk to them; `renderNotes` plays notes on them from `waves`
+  (`EXPANSION_CHANNELS`: FDS is channel 5, the N163's 6–13).
 - No dependencies, ~6 KB gzipped, runs anywhere JavaScript does (browser, worker, Node).
 - Pure and deterministic: the same writes always give the same samples, so it
   can be tested by measuring rather than by ear.

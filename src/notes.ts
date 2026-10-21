@@ -28,7 +28,7 @@ import { CPU_HZ, DMC_PERIODS, FRAME_HZ, LENGTH_TABLE } from './constants.js';
 import { renderWrites, type Click, type RegisterWrite, type RenderOptions } from './render.js';
 
 /**
- * `[midi, startTick, durationTicks, channel 0..2, volume, period, duty,
+ * `[midi, startTick, durationTicks, channel, volume, period, duty,
  * volumeEnd, lengthTicks, bendIndex, envelope, sweep, levelIndex]` — `lengthTicks` counts at
  * 120 Hz and 0 means unlimited; `bendIndex` points into `ApuInput.bends`, or is
  * -1; `envelope` is the low five bits of `$4000` when the chip's own envelope
@@ -36,6 +36,12 @@ import { renderWrites, type Click, type RegisterWrite, type RenderOptions } from
  * `$4001` byte, or -1/absent when the data has none; `levelIndex`, on a pulse, points into
  * `ApuInput.levels` for a level that does not go in a straight line from `volume` to `volumeEnd`,
  * or is -1/absent.
+ *
+ * Channels 0..2 are the 2A03's pulses and triangle. 5 is the Disk System's wave channel (FDS) and
+ * 6..13 the N163's channels in the order the chip switches them on — see `EXPANSION_CHANNELS`. On
+ * those `period` is the frequency in hundredths of a hertz (their registers depend on the wave's
+ * length and the chip's channel count, which the adapter chooses itself), `volume` is 0..15, and
+ * `waveIndex` (the 14th field) points into `ApuInput.waves`: the waveform the note plays.
  */
 export type PitchedRow = readonly [
   number,
@@ -51,7 +57,12 @@ export type PitchedRow = readonly [
   number?,
   number?,
   number?,
+  number?,
 ];
+
+/** Pitched-row channels past the 2A03's: the FDS, then the N163's eight. */
+export const EXPANSION_CHANNELS = { fds: 5, n163: [6, 7, 8, 9, 10, 11, 12, 13] } as const;
+
 
 /**
  * A level curve: `[position 0..1, level 0..15]` at each change of level, in order. The level holds
@@ -109,6 +120,11 @@ export interface ApuInput {
   bends?: readonly BendCurve[];
   /** Level curves the pulse and noise notes point at — see `PitchedRow`'s `levelIndex`. Shared like `bends`. */
   levels?: readonly LevelCurve[];
+  /**
+   * Waveforms the expansion notes play — see `PitchedRow`'s `waveIndex`: 64 samples 0..63 for the
+   * FDS, a multiple of 4 samples 0..15 for an N163 channel.
+   */
+  waves?: readonly (readonly number[])[];
   /** Seconds per tick. */
   secondsPerTick: number;
   /** Length of the piece in ticks. */
@@ -508,7 +524,161 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
     }
   });
 
+  expansionWrites(input, lead, voicesOf, frames, put);
   return writes;
+}
+
+const hzOf = (row: PitchedRow) => row[5] / 100;
+
+/**
+ * The expansion channels' notes as writes: what a driver for the FDS or the N163 would write to
+ * sound them — the waveform when it changes, then the frequency and level, and once a frame the
+ * level while it ramps and the frequency while it bends.
+ */
+function expansionWrites(
+  input: ApuInput,
+  lead: number,
+  voicesOf: (rows: readonly (PitchedRow | DrumRow)[], keep: (row: never) => boolean) => Voice[],
+  frames: (start: number, end: number) => Iterable<{ time: number; position: number }>,
+  put: (time: number, address: number, value: number) => void
+) {
+  const bends = input.bends ?? [];
+  const waves = input.waves ?? [];
+  const curveOf = (row: PitchedRow) => (row[9] >= 0 ? (bends[row[9]] ?? null) : null);
+  const levelsOf = (row: PitchedRow) =>
+    row[12] !== undefined && row[12] >= 0 ? (input.levels?.[row[12]] ?? null) : null;
+  const levelAtOf = (row: PitchedRow) => {
+    const curve = levelsOf(row);
+    return (at: number) =>
+      curve
+        ? Math.min(15, Math.max(0, levelAt(curve, at)))
+        : Math.min(15, Math.max(0, Math.round(row[4] + (row[7] - row[4]) * at)));
+  };
+
+  // FDS.
+  {
+    const voices = voicesOf(input.pitched, ((row: PitchedRow) =>
+      row[3] === EXPANSION_CHANNELS.fds && row[5] > 0) as (row: never) => boolean);
+    if (voices.length > 0) {
+      put(0, 0x4087, 0x80); // modulation off: the bends carry the vibrato
+      put(0, 0x408a, 0xe8);
+    }
+    const freqOf = (hz: number) => Math.min(0xfff, Math.max(1, Math.round((hz * 4194304) / CPU_HZ)));
+    let lastWave = -1;
+    voices.forEach((voice, i) => {
+      const row = voice.row as PitchedRow;
+      const waveIndex = row[13] ?? -1;
+      if (waveIndex >= 0 && waveIndex !== lastWave && waves[waveIndex]) {
+        put(voice.start, 0x4089, 0x80);
+        waves[waveIndex].slice(0, 64).forEach((v, k) => put(voice.start, 0x4040 + k, v & 0x3f));
+        put(voice.start, 0x4089, 0x00);
+        lastWave = waveIndex;
+      }
+      const level = levelAtOf(row);
+      const gain = (l: number) => 0x80 | Math.round((l * 32) / 15);
+      const freq = freqOf(hzOf(row));
+      put(voice.start, 0x4080, gain(level(0)));
+      put(voice.start, 0x4082, freq & 0xff);
+      put(voice.start, 0x4083, 0x40 | (freq >> 8));
+      const curve = curveOf(row);
+      const ramps = levelsOf(row) !== null || row[4] !== row[7];
+      if (curve || ramps) {
+        let lastLevel = level(0);
+        let lastFreq = freq;
+        for (const { time, position } of frames(voice.start, voice.end)) {
+          if (ramps) {
+            const now = level(position);
+            if (now !== lastLevel) put(time, 0x4080, gain(now));
+            lastLevel = now;
+          }
+          if (curve) {
+            const now = freqOf(hzOf(row) * Math.pow(2, bendAt(curve, position) / 12));
+            if (now !== lastFreq) {
+              put(time, 0x4082, now & 0xff);
+              if (now >> 8 !== lastFreq >> 8) put(time, 0x4083, 0x40 | (now >> 8));
+            }
+            lastFreq = now;
+          }
+        }
+      }
+      const next = voices[i + 1];
+      if (!next || next.start > voice.end + 1e-9) put(voice.end, 0x4080, 0x80);
+    });
+  }
+
+  // N163: as many channels on as the piece uses, each with its own stretch of the chip's RAM.
+  const n163Voices = EXPANSION_CHANNELS.n163.map((channel) =>
+    voicesOf(input.pitched, ((row: PitchedRow) => row[3] === channel && row[5] > 0) as (row: never) => boolean)
+  );
+  const used = n163Voices.reduce((most, voices, k) => (voices.length > 0 ? k + 1 : most), 0);
+  if (used === 0) return;
+  const count = used;
+  // Registers take the top 8·count bytes; the rest is wave RAM, shared out evenly, in whole fours.
+  const freeNibbles = (0x80 - 8 * count) * 2;
+  const area = Math.max(4, Math.floor(freeNibbles / count / 4) * 4);
+  const ramWrite = (time: number, address: number, bytes: readonly number[]) => {
+    put(time, 0xf800, 0x80 | (address & 0x7f));
+    for (const b of bytes) put(time, 0x4800, b & 0xff);
+  };
+  // The channel count lives in the top nibble of $7F, beside slot 7's volume.
+  const countBits = (count - 1) << 4;
+  ramWrite(0, 0x7f, [countBits]);
+  n163Voices.forEach((voices, k) => {
+    const slot = 7 - k;
+    const base = 0x40 + slot * 8;
+    const start = k * area; // in nibbles
+    let lastWave = -1;
+    let length = area;
+    const volumeByte = (v: number) => (slot === 7 ? countBits : 0) | (v & 0x0f);
+    voices.forEach((voice, i) => {
+      const row = voice.row as PitchedRow;
+      const waveIndex = row[13] ?? -1;
+      const wave = waveIndex >= 0 ? waves[waveIndex] : null;
+      if (wave && waveIndex !== lastWave) {
+        // A wave longer than the stretch this channel has is resampled to fit.
+        length = Math.min(area, Math.max(4, Math.floor(wave.length / 4) * 4));
+        const samples = Array.from({ length }, (_, n) => wave[Math.floor((n * wave.length) / length)] & 0x0f);
+        const bytes: number[] = [];
+        for (let n = 0; n < length; n += 2) bytes.push(samples[n] | ((samples[n + 1] ?? 0) << 4));
+        ramWrite(voice.start, start >> 1, bytes);
+        lastWave = waveIndex;
+      }
+      const freqOf = (hz: number) =>
+        Math.min(0x3ffff, Math.max(1, Math.round((hz * 15 * 65536 * count * length) / CPU_HZ)));
+      const regs = (freq: number, volume: number) => [
+        freq & 0xff,
+        (freq >> 8) & 0xff,
+        ((256 - length) & 0xfc) | ((freq >> 16) & 3),
+        0,
+        0,
+        0,
+        start & 0xff,
+        volumeByte(volume),
+      ];
+      const level = levelAtOf(row);
+      const freq = freqOf(hzOf(row));
+      ramWrite(voice.start, base, regs(freq, level(0)));
+      const curve = curveOf(row);
+      const ramps = levelsOf(row) !== null || row[4] !== row[7];
+      if (curve || ramps) {
+        let lastLevel = level(0);
+        let lastFreq = freq;
+        for (const { time, position } of frames(voice.start, voice.end)) {
+          const nowLevel = ramps ? level(position) : lastLevel;
+          const nowFreq = curve ? freqOf(hzOf(row) * Math.pow(2, bendAt(curve, position) / 12)) : lastFreq;
+          if (nowFreq !== lastFreq) {
+            // The frequency bytes alone, not the phase after them: that is the chip's running count.
+            ramWrite(time, base, [nowFreq & 0xff, (nowFreq >> 8) & 0xff, ((256 - length) & 0xfc) | ((nowFreq >> 16) & 3)]);
+          }
+          if (nowLevel !== lastLevel) ramWrite(time, base + 7, [volumeByte(nowLevel)]);
+          lastLevel = nowLevel;
+          lastFreq = nowFreq;
+        }
+      }
+      const next = voices[i + 1];
+      if (!next || next.start > voice.end + 1e-9) ramWrite(voice.end, base + 7, [volumeByte(0)]);
+    });
+  });
 }
 
 /** Render a decoded piece: `notesToWrites` into `renderWrites`, with the tick-based extras. */

@@ -43,6 +43,11 @@ export interface RenderOptions {
    * voice on its own.
    */
   voiceLevels?: readonly number[];
+  /**
+   * Expansion chips to emulate (`'FDS'`, `'N163'`). Left out, they are inferred from the writes: one
+   * to `$4040`–`$408A` means an FDS, one to `$F800`/`$4800` an N163.
+   */
+  expansion?: readonly string[];
   /** Skip the output filters. For tests that want the raw mixer. */
   filters?: boolean;
   /** Add the console's second high-pass at 440 Hz — see `OutputFilters`. */
@@ -90,7 +95,8 @@ export function renderWrites(
     .map((write, index) => ({ at: Math.max(0, Math.round(write.time * rate)), index, write }))
     .sort((a, b) => a.at - b.at || a.index - b.index);
 
-  const chip = new Apu(rate, { lengthCounter: options.lengthCounter, memory: options.memory });
+  const expansion = options.expansion ?? expansionOf(writes);
+  const chip = new Apu(rate, { lengthCounter: options.lengthCounter, memory: options.memory, expansion });
   const filters = new OutputFilters(rate, options.consoleBass ?? false);
   const out = new Float32Array(Math.ceil(total / oversample));
 
@@ -112,6 +118,16 @@ export function renderWrites(
     dmc: new Uint8Array(BLOCK),
   };
   const { pulse1: p1, pulse2: p2, triangle: tri, noise, dmc } = buffers;
+  /*
+   * The expansion voices, each in a buffer of its own so a fader reaches it: the FDS at voice 5,
+   * the N163's channels at 6.. — its always-on slot 7 first, then 6, 5… as more are switched on.
+   */
+  const fdsOut = chip.fds ? new Float64Array(BLOCK) : null;
+  const n163Out = chip.n163 ? Array.from({ length: 8 }, () => new Float64Array(BLOCK)) : null;
+  if (fdsOut) buffers.fds = fdsOut;
+  if (n163Out) buffers.n163 = n163Out;
+  const fFds = faders ? (faders[5] ?? 1) : 1;
+  const fN163 = Array.from({ length: 8 }, (_, slot) => (faders ? (faders[6 + 7 - slot] ?? 1) : 1));
   const hasClicks = clicks.length > 0;
   const f0 = faders ? (faders[0] ?? 1) : 1;
   const f1 = faders ? (faders[1] ?? 1) : 1;
@@ -145,6 +161,8 @@ export function renderWrites(
         const tnd = tri[k] / 8227 + noise[k] / 12241 + dmc[k] / 22638;
         mixed = PULSE_MIX[p1[k] + p2[k]] + (tnd === 0 ? 0 : 159.79 / (1 / tnd + 100));
       }
+      if (fdsOut) mixed += fdsOut[k] * fFds;
+      if (n163Out) for (let slot = 0; slot < 8; slot++) mixed += n163Out[slot][k] * fN163[slot];
       // Filtered at the oversampled rate: the low-pass then doubles as the
       // anti-aliasing filter the decimation needs.
       let value = filtered ? filters.step(mixed) : mixed;
@@ -182,4 +200,15 @@ export function renderWrites(
   }
 
   return { samples: out, sampleRate, duration: out.length / sampleRate, peak };
+}
+
+/** The expansion chips a list of writes talks to — see `RenderOptions.expansion`. */
+export function expansionOf(writes: readonly RegisterWrite[]): string[] {
+  let fds = false;
+  let n163 = false;
+  for (const w of writes) {
+    if (w.address >= 0x4040 && w.address <= 0x408a) fds = true;
+    else if ((w.address >= 0xf800 && w.address <= 0xffff) || (w.address >= 0x4800 && w.address <= 0x4fff)) n163 = true;
+  }
+  return [...(fds ? ['FDS'] : []), ...(n163 ? ['N163'] : [])];
 }

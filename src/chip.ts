@@ -41,6 +41,7 @@ import {
 } from './constants.js';
 import { LONG_CYCLE, LONG_HIGH_BEFORE, LONG_INDEX, LONG_STATES } from './lfsr.js';
 import { decodeSweep, sweepMutes, sweepTarget, type SweepConfig } from './sweep.js';
+import { FdsChip, N163Chip, type FdsSnapshot, type N163Snapshot } from './expansion.js';
 
 /** The four duty sequences flattened, `duty * 8 + step`. */
 const DUTY_FLAT = Uint8Array.from(DUTY_SEQUENCES.flat());
@@ -148,6 +149,13 @@ export interface ChannelBuffers {
   /** Fractional: the gate is averaged over the shifts in a sample. */
   noise: Float64Array;
   dmc: Uint8Array;
+  /** The FDS wave channel, in `mixApu` units (added to, not overwritten) — when the chip has one. */
+  fds?: Float64Array;
+  /**
+   * The N163's channels by register slot 0..7 (slot 7, `$78`, is the one always on), in `mixApu`
+   * units; index 8, if given, takes every slot without a buffer of its own.
+   */
+  n163?: (Float64Array | undefined)[];
 }
 
 /** Cartridge memory for the DMC: the bytes of `$8000`–`$FFFF`, or a reader for any address. */
@@ -183,6 +191,9 @@ export interface ApuSnapshot {
     constant: boolean;
     enabled: boolean;
   };
+  /** The expansion chips' state, when the chip has them (`ApuChipOptions.expansion`). */
+  fds?: FdsSnapshot;
+  n163?: N163Snapshot;
   dmc: {
     /** Output level, 0..127. */
     level: number;
@@ -205,6 +216,11 @@ export interface ApuChipOptions {
   lengthCounter?: boolean;
   /** Where the DMC reads its samples from — see `ApuMemory`. Reads 0 when absent. */
   memory?: ApuMemory;
+  /**
+   * Expansion sound on the cartridge: `'FDS'` takes `$4040`–`$408A`, `'N163'` its address port
+   * (`$F800`), data port (`$4800`) and `$E000`. Their output goes to `ChannelBuffers.fds`/`n163`.
+   */
+  expansion?: readonly string[];
 }
 
 const newEnvelope = (): Envelope => ({ start: false, divider: 0, decay: 0 });
@@ -244,6 +260,10 @@ function clockEnvelope(env: Envelope, period: number, loop: boolean) {
 
 export class Apu {
   readonly sampleRate: number;
+  /** The Disk System's wave channel, when `expansion` has `'FDS'`. */
+  readonly fds: FdsChip | null;
+  /** Namco's 163, when `expansion` has `'N163'`. */
+  readonly n163: N163Chip | null;
   private readonly lengthCounter: boolean;
 
   private readonly pulses: [Pulse, Pulse] = [newPulse(true), newPulse(false)];
@@ -306,6 +326,8 @@ export class Apu {
   constructor(sampleRate: number, options: ApuChipOptions = {}) {
     this.sampleRate = sampleRate;
     this.lengthCounter = options.lengthCounter !== false;
+    this.fds = options.expansion?.includes('FDS') ? new FdsChip(sampleRate) : null;
+    this.n163 = options.expansion?.includes('N163') ? new N163Chip(sampleRate) : null;
     this.samplesPerQuarterFrame = sampleRate / QUARTER_FRAME_HZ;
     this.frameCountdown = this.samplesPerQuarterFrame;
     for (const p of this.pulses) this.retunePulse(p);
@@ -321,8 +343,16 @@ export class Apu {
           : () => 0;
   }
 
-  /** A CPU write to one of the APU's registers. Anything outside `$4000`–`$4017` is ignored. */
+  /**
+   * A CPU write to one of the APU's registers — or an expansion chip's, when there is one.
+   * Anything else is ignored.
+   */
   write(address: number, value: number) {
+    if (address > 0x4017) {
+      if (this.fds?.write(address, value)) return;
+      this.n163?.write(address, value);
+      return;
+    }
     const v = value & 0xff;
     switch (address) {
       case 0x4000:
@@ -490,6 +520,18 @@ export class Apu {
    * same order — the buffers come out bit for bit the same as `count` calls.
    */
   render(count: number, buffers: ChannelBuffers, offset = 0) {
+    if (this.fds && buffers.fds) {
+      buffers.fds.fill(0, offset, offset + count);
+      this.fds.render(count, buffers.fds, offset);
+    }
+    if (this.n163 && buffers.n163) {
+      const cleared = new Set<Float64Array>();
+      for (const out of buffers.n163) if (out && !cleared.has(out)) {
+        out.fill(0, offset, offset + count);
+        cleared.add(out);
+      }
+      this.n163.render(count, buffers.n163, offset);
+    }
     let done = 0;
     while (done < count) {
       // Samples before the one on which the counter reaches zero. Subtracting
@@ -726,6 +768,8 @@ export class Apu {
         constant: n.constant,
         enabled: n.enabled,
       },
+      ...(this.fds ? { fds: this.fds.snapshot() } : {}),
+      ...(this.n163 ? { n163: this.n163.snapshot() } : {}),
       dmc: {
         level: this.dmc.level,
         rateIndex: this.dmc.rateIndex,

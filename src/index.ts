@@ -31,6 +31,15 @@ export {
 } from './chip.js';
 export { mixApu, OutputFilters } from './mixer.js';
 export {
+  FdsChip,
+  N163Chip,
+  fdsHz,
+  n163Hz,
+  type FdsSnapshot,
+  type N163ChannelSnapshot,
+  type N163Snapshot,
+} from './expansion.js';
+export {
   SWEEP_HZ,
   decodeSweep,
   sweepMutes,
@@ -39,6 +48,7 @@ export {
   type SweepConfig,
 } from './sweep.js';
 export {
+  expansionOf,
   renderWrites,
   type Click,
   type RegisterWrite,
@@ -47,6 +57,7 @@ export {
 } from './render.js';
 export {
   bendAt,
+  EXPANSION_CHANNELS,
   levelAt,
   notesToWrites,
   renderNotes,
