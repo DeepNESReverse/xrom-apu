@@ -623,10 +623,33 @@ function expansionWrites(
   // The channel count lives in the top nibble of $7F, beside slot 7's volume.
   const countBits = (count - 1) << 4;
   ramWrite(0, 0x7f, [countBits]);
+  /*
+   * When every waveform the piece plays fits in the wave RAM at once, each gets a place of its own,
+   * written before the first note, and a channel just points at it — as Namco's drivers do, several
+   * channels reading one wave. Only when they do not fit does each channel get a stretch of its own
+   * that its waves are written into as they come (and squeezed into, if longer).
+   */
+  const n163Waves = [...new Set(n163Voices.flat().map((voice) => (voice.row as PitchedRow)[13] ?? -1))].filter(
+    (index) => index >= 0 && waves[index]
+  );
+  const fitted = (index: number) => Math.min(256, Math.max(4, Math.floor(waves[index].length / 4) * 4));
+  const shared = new Map<number, { start: number; length: number }>();
+  if (n163Waves.reduce((sum, index) => sum + fitted(index), 0) <= freeNibbles) {
+    let at = 0;
+    for (const index of n163Waves) {
+      const length = fitted(index);
+      shared.set(index, { start: at, length });
+      const wave = waves[index];
+      const bytes: number[] = [];
+      for (let n = 0; n < length; n += 2) bytes.push((wave[n] & 0x0f) | ((wave[n + 1] ?? 0) & 0x0f) << 4);
+      ramWrite(0, at >> 1, bytes);
+      at += length;
+    }
+  }
   n163Voices.forEach((voices, k) => {
     const slot = 7 - k;
     const base = 0x40 + slot * 8;
-    const start = k * area; // in nibbles
+    let start = k * area; // in nibbles
     let lastWave = -1;
     let length = area;
     const volumeByte = (v: number) => (slot === 7 ? countBits : 0) | (v & 0x0f);
@@ -634,7 +657,12 @@ function expansionWrites(
       const row = voice.row as PitchedRow;
       const waveIndex = row[13] ?? -1;
       const wave = waveIndex >= 0 ? waves[waveIndex] : null;
-      if (wave && waveIndex !== lastWave) {
+      const place = shared.get(waveIndex);
+      if (place) {
+        start = place.start;
+        length = place.length;
+      } else if (wave && waveIndex !== lastWave) {
+        start = k * area;
         // A wave longer than the stretch this channel has is resampled to fit.
         length = Math.min(area, Math.max(4, Math.floor(wave.length / 4) * 4));
         const samples = Array.from({ length }, (_, n) => wave[Math.floor((n * wave.length) / length)] & 0x0f);
