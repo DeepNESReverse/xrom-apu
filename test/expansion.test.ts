@@ -67,6 +67,16 @@ describe('N163', () => {
     expect([chip.read(), chip.read()]).toEqual([0x12, 0x34]);
   });
 
+  it('steps its address on a read as on a write — how Namco drivers skip the phase bytes', () => {
+    const chip = new N163Chip(48000);
+    chip.write(0xf800, 0x80 | 0x78);
+    chip.write(0x4800, 0x11); // frequency low
+    chip.read(); // phase low, left alone
+    chip.write(0x4800, 0x22); // frequency middle
+    expect(chip.port).toBe(0x80 | 0x7b);
+    expect([chip.ram[0x78], chip.ram[0x79], chip.ram[0x7a]]).toEqual([0x11, 0, 0x22]);
+  });
+
   it('plays a channel at CPU_HZ · f / (15 · 65536 · channels · length)', () => {
     const apu = new Apu(96000, { expansion: ['N163'] });
     const n163 = apu.n163!;
@@ -75,7 +85,8 @@ describe('N163', () => {
     for (let n = 0; n < 32; n += 2) n163.write(0x4800, SQUARE32[n] | (SQUARE32[n + 1] << 4));
     const freq = Math.round((220 * 15 * 65536 * 1 * 32) / 1789772.7272727273);
     n163.write(0xf800, 0x80 | 0x78);
-    for (const b of [freq & 0xff, (freq >> 8) & 0xff, (256 - 32) | (freq >> 16), 0, 0, 0, 0, 0x0f]) n163.write(0x4800, b);
+    // Frequency low, phase, middle, phase, high two bits + length, phase, wave address, volume.
+    for (const b of [freq & 0xff, 0, (freq >> 8) & 0xff, 0, (256 - 32) | (freq >> 16), 0, 0, 0x0f]) n163.write(0x4800, b);
     const snapshot = apu.snapshot().n163!;
     expect(snapshot.channels).toBe(1);
     expect(snapshot.active[0]).toMatchObject({ slot: 7, length: 32, volume: 15 });

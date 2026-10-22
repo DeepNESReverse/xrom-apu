@@ -675,10 +675,10 @@ function expansionWrites(
         Math.min(0x3ffff, Math.max(1, Math.round((hz * 15 * 65536 * count * length) / CPU_HZ)));
       const regs = (freq: number, volume: number) => [
         freq & 0xff,
+        0,
         (freq >> 8) & 0xff,
+        0,
         ((256 - length) & 0xfc) | ((freq >> 16) & 3),
-        0,
-        0,
         0,
         start & 0xff,
         volumeByte(volume),
@@ -696,7 +696,9 @@ function expansionWrites(
           const nowFreq = curve ? freqOf(hzOf(row) * Math.pow(2, bendAt(curve, position) / 12)) : lastFreq;
           if (nowFreq !== lastFreq) {
             // The frequency bytes alone, not the phase after them: that is the chip's running count.
-            ramWrite(time, base, [nowFreq & 0xff, (nowFreq >> 8) & 0xff, ((256 - length) & 0xfc) | ((nowFreq >> 16) & 3)]);
+            ramWrite(time, base, [nowFreq & 0xff]);
+            ramWrite(time, base + 2, [(nowFreq >> 8) & 0xff]);
+            ramWrite(time, base + 4, [((256 - length) & 0xfc) | ((nowFreq >> 16) & 3)]);
           }
           if (nowLevel !== lastLevel) ramWrite(time, base + 7, [volumeByte(nowLevel)]);
           lastLevel = nowLevel;

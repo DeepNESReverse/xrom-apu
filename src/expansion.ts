@@ -292,22 +292,27 @@ export class N163Chip {
     return v;
   }
 
+  /** The address port as it stands — the next RAM byte the data port reaches, with bit 7 for auto-increment. */
+  get port(): number {
+    return this.address | (this.autoIncrement ? 0x80 : 0);
+  }
+
   get channels(): number {
     return ((this.ram[0x7f] >> 4) & 7) + 1;
   }
 
   /**
-   * A channel's eight bytes: frequency low, middle, and high two bits with the wave length above
-   * them; three bytes of phase; the wave's address; the volume. (Read off what Namco's own drivers
-   * write — Erika to Satoru and Mappy Kids both put `$E0`/`$F0`, a 32- or 16-sample wave, in the
-   * third byte.)
+   * A channel's eight bytes, interleaved as on the chip: frequency low, phase low, frequency
+   * middle, phase middle, the frequency's high two bits with the wave length above them, phase
+   * high, the wave's address, the volume. (Namco's drivers write the frequency bytes and step over
+   * the phase ones by READING the data port — auto-increment counts reads too.)
    */
   private channel(slot: number) {
     const base = 0x40 + slot * 8;
     const r = this.ram;
     return {
-      frequency: r[base] | (r[base + 1] << 8) | ((r[base + 2] & 3) << 16),
-      length: 256 - (r[base + 2] & 0xfc),
+      frequency: r[base] | (r[base + 2] << 8) | ((r[base + 4] & 3) << 16),
+      length: 256 - (r[base + 4] & 0xfc),
       waveAddress: r[base + 6],
       volume: r[base + 7] & 0x0f,
     };
