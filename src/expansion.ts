@@ -1,9 +1,9 @@
 /**
- * The two expansion sound chips the Famicom's own games carried most: the Disk
- * System's wavetable voice (FDS) and Namco's 163 (N163). Each is a channel the
- * 2A03 does not have — a waveform drawn in RAM, played back at a pitch — and
- * games that use them put their melody there, so without them a soundtrack is
- * its bass and drums.
+ * The expansion sound chips the Famicom's own games carried most: the Disk
+ * System's wavetable voice (FDS), Namco's 163 (N163) and Konami's VRC6. Each
+ * adds channels the 2A03 does not have — a waveform drawn in RAM played back at
+ * a pitch, or two more pulses and a sawtooth — and games that use them put
+ * their melody there, so without them a soundtrack is its bass and drums.
  *
  * Like the APU here they run at the sample rate, not per CPU cycle: each sample
  * advances the chip by `CPU_HZ / sampleRate` cycles' worth of its counters.
@@ -12,7 +12,9 @@
  * renderer adds it to the mix. The levels relative to the 2A03 follow the
  * common reference players: FDS at full gain about as loud as both pulses at
  * full, an N163 channel at full volume about as loud as one pulse — divided by
- * the number of channels it time-shares its one output with, as the chip does.
+ * the number of channels it time-shares its one output with, as the chip does —
+ * and a VRC6 pulse at full volume one and a half times a 2A03 pulse, as Mesen2
+ * mixes it (`VRC6_STEP`).
  */
 
 import { CPU_HZ } from './constants.js';
@@ -25,6 +27,13 @@ const N163_FULL = 0.16;
 const FDS_MASTER = [1, 2 / 3, 1 / 2, 2 / 5];
 /** Mod table entries → how far each moves the mod counter; 4 resets it. */
 const MOD_STEP = [0, 1, 2, 4, 0, -4, -2, -1];
+/**
+ * One step of the VRC6's output (pulse 0..15 + pulse 0..15 + saw 0..31), in `mixApu` units. From
+ * Mesen2, which adds the chip's summed output × 15 (Core/NES/Mappers/Audio/Vrc6Audio.h) × 5
+ * (Core/NES/NesSoundMixer.cpp, GetOutputVolume) to a 2A03 mix whose `mixApu` 1.0 is 5000 there:
+ * 75 / 5000. A VRC6 pulse at volume 15 is so 0.225, about one and a half 2A03 pulses at 15.
+ */
+const VRC6_STEP = 75 / 5000;
 
 export interface FdsSnapshot {
   /** 12-bit wave frequency; Hz = CPU_HZ * frequency / 4194304. */
@@ -364,9 +373,227 @@ export class N163Chip {
   }
 }
 
+/** One of the VRC6's two pulses, `$9000`–`$9002` or `$A000`–`$A002`. */
+export interface Vrc6PulseSnapshot {
+  /** 12-bit period; Hz = CPU_HZ / (16 · (period + 1)) — see `vrc6PulseHz`. */
+  period: number;
+  volume: number;
+  /** 0..7: high for duty + 1 of every 16 steps. */
+  duty: number;
+  /** The mode bit (`$x000` bit 7): the volume put out as it is, the duty ignored. */
+  constant: boolean;
+  enabled: boolean;
+}
+
+export interface Vrc6Snapshot {
+  pulse: [Vrc6PulseSnapshot, Vrc6PulseSnapshot];
+  saw: {
+    /** 12-bit period; Hz = CPU_HZ / (14 · (period + 1)) — see `vrc6SawHz`. */
+    period: number;
+    /** The accumulator rate, 0..63; past 42 the 8-bit accumulator wraps and the wave breaks up. */
+    rate: number;
+    enabled: boolean;
+  };
+  /** `$9003` bit 0: every oscillator stopped where it is. */
+  halted: boolean;
+  /** `$9003`: the periods shifted right by 4 (bit 1) or 8 (bit 2, which wins) — ×16 / ×256 pitch. */
+  shift: number;
+}
+
+interface Vrc6Pulse {
+  volume: number;
+  duty: number;
+  constant: boolean;
+  period: number;
+  enabled: boolean;
+  /** CPU cycles until the next step, fractional. */
+  timer: number;
+  step: number;
+}
+
+/**
+ * Konami's VRC6: two pulses with eight duties and a sawtooth, beside the 2A03 (Akumajou Densetsu,
+ * Madara, Esper Dream 2). The registers are at the addresses the NSF format gives them —
+ * `$9000`–`$9003`, `$A000`–`$A002`, `$B000`–`$B002`; the cartridges themselves differ in which of
+ * A0/A1 they wire to the chip, which a player maps before here.
+ *
+ * Each channel counts down `(period >> shift) + 1` CPU cycles a step, as Mesen2's Vrc6Pulse/Vrc6Saw
+ * do. Output is the average over each sample of what the chip puts out, so a high note at a low
+ * sample rate keeps its level.
+ */
+export class Vrc6Chip {
+  private readonly cyclesPerSample: number;
+  private readonly pulses: [Vrc6Pulse, Vrc6Pulse] = [Vrc6Chip.newPulse(), Vrc6Chip.newPulse()];
+  private sawRate = 0;
+  private sawPeriod = 0;
+  private sawEnabled = false;
+  private sawTimer = 1;
+  private sawStep = 0;
+  private sawAccumulator = 0;
+  private halted = false;
+  private shift = 0;
+
+  private static newPulse(): Vrc6Pulse {
+    return { volume: 0, duty: 0, constant: false, period: 0, enabled: false, timer: 1, step: 0 };
+  }
+
+  constructor(sampleRate: number) {
+    this.cyclesPerSample = CPU_HZ / sampleRate;
+  }
+
+  /** A write to `$9000`–`$9003`, `$A000`–`$A002` or `$B000`–`$B002`. Returns false for any other address. */
+  write(address: number, value: number): boolean {
+    const v = value & 0xff;
+    if (address === 0x9003) {
+      this.halted = (v & 1) !== 0;
+      this.shift = v & 4 ? 8 : v & 2 ? 4 : 0;
+      return true;
+    }
+    if ((address >= 0x9000 && address <= 0x9002) || (address >= 0xa000 && address <= 0xa002)) {
+      const p = this.pulses[address >> 12 === 0x9 ? 0 : 1];
+      switch (address & 3) {
+        case 0:
+          p.volume = v & 0x0f;
+          p.duty = (v >> 4) & 7;
+          p.constant = (v & 0x80) !== 0;
+          break;
+        case 1:
+          p.period = (p.period & 0xf00) | v;
+          break;
+        case 2:
+          p.period = (p.period & 0x0ff) | ((v & 0x0f) << 8);
+          p.enabled = (v & 0x80) !== 0;
+          // Clearing E resets the duty step; the divider runs on.
+          if (!p.enabled) p.step = 0;
+          break;
+      }
+      return true;
+    }
+    if (address >= 0xb000 && address <= 0xb002) {
+      switch (address & 3) {
+        case 0:
+          this.sawRate = v & 0x3f;
+          break;
+        case 1:
+          this.sawPeriod = (this.sawPeriod & 0xf00) | v;
+          break;
+        case 2:
+          this.sawPeriod = (this.sawPeriod & 0x0ff) | ((v & 0x0f) << 8);
+          this.sawEnabled = (v & 0x80) !== 0;
+          if (!this.sawEnabled) {
+            this.sawStep = 0;
+            this.sawAccumulator = 0;
+          }
+          break;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private static pulseLevel(p: Vrc6Pulse): number {
+    if (!p.enabled) return 0;
+    if (p.constant) return p.volume;
+    return p.step <= p.duty ? p.volume : 0;
+  }
+
+  /**
+   * Advance `count` samples, ADDING each channel's output to `outs[0]` (pulse 1), `outs[1]` (pulse
+   * 2) and `outs[2]` (saw) — or, for a channel without a buffer of its own, to `outs[3]` if given —
+   * from `offset`.
+   */
+  render(count: number, outs: readonly (Float64Array | undefined)[], offset = 0) {
+    const cps = this.cyclesPerSample;
+    const scale = VRC6_STEP / cps;
+    const running = !this.halted;
+    for (let c = 0; c < 2; c++) {
+      const out = outs[c] ?? outs[3];
+      const p = this.pulses[c];
+      const reload = (p.period >> this.shift) + 1;
+      // Not stepping, or stepping makes no difference: one level for the whole run.
+      if (!running || !p.enabled || p.constant || p.volume === 0) {
+        if (out) {
+          const level = Vrc6Chip.pulseLevel(p) * VRC6_STEP;
+          if (level !== 0) for (let k = 0; k < count; k++) out[offset + k] += level;
+        }
+        if (running && p.enabled) {
+          // The duty step moves on all the same, for when the level comes back.
+          const cycles = count * cps;
+          if (cycles >= p.timer) {
+            const steps = 1 + Math.floor((cycles - p.timer) / reload);
+            p.step = (p.step + steps) & 15;
+            p.timer = reload - ((cycles - p.timer) % reload);
+          } else p.timer -= cycles;
+        }
+        continue;
+      }
+      for (let k = 0; k < count; k++) {
+        let left = cps;
+        let sum = 0;
+        while (left >= p.timer) {
+          sum += (p.step <= p.duty ? p.volume : 0) * p.timer;
+          left -= p.timer;
+          p.step = (p.step + 1) & 15;
+          p.timer = reload;
+        }
+        sum += (p.step <= p.duty ? p.volume : 0) * left;
+        p.timer -= left;
+        if (out) out[offset + k] += sum * scale;
+      }
+    }
+    {
+      const out = outs[2] ?? outs[3];
+      const reload = (this.sawPeriod >> this.shift) + 1;
+      if (!running || !this.sawEnabled) {
+        const level = this.sawEnabled ? (this.sawAccumulator >> 3) * VRC6_STEP : 0;
+        if (out && level !== 0) for (let k = 0; k < count; k++) out[offset + k] += level;
+        return;
+      }
+      for (let k = 0; k < count; k++) {
+        let left = cps;
+        let sum = 0;
+        while (left >= this.sawTimer) {
+          sum += (this.sawAccumulator >> 3) * this.sawTimer;
+          left -= this.sawTimer;
+          this.sawTimer = reload;
+          // Fourteen steps a cycle: the accumulator grows on every other one and starts over on the 14th.
+          this.sawStep = (this.sawStep + 1) % 14;
+          if (this.sawStep === 0) this.sawAccumulator = 0;
+          else if ((this.sawStep & 1) === 0) this.sawAccumulator = (this.sawAccumulator + this.sawRate) & 0xff;
+        }
+        sum += (this.sawAccumulator >> 3) * left;
+        this.sawTimer -= left;
+        if (out) out[offset + k] += sum * scale;
+      }
+    }
+  }
+
+  snapshot(): Vrc6Snapshot {
+    const pulse = (p: Vrc6Pulse): Vrc6PulseSnapshot => ({
+      period: p.period,
+      volume: p.volume,
+      duty: p.duty,
+      constant: p.constant,
+      enabled: p.enabled,
+    });
+    return {
+      pulse: [pulse(this.pulses[0]), pulse(this.pulses[1])],
+      saw: { period: this.sawPeriod, rate: this.sawRate, enabled: this.sawEnabled },
+      halted: this.halted,
+      shift: this.shift,
+    };
+  }
+}
+
 /** Hz of an FDS frequency register value. */
 export const fdsHz = (frequency: number) => (CPU_HZ * frequency) / 4194304;
 
 /** Hz of an N163 channel, from its frequency, wave length and the number of channels on. */
 export const n163Hz = (frequency: number, length: number, channels: number) =>
   (CPU_HZ * frequency) / (15 * 65536 * channels * length);
+
+/** Hz of a VRC6 pulse period (with `$9003`'s shift, if any): 16 steps of `(period >> shift) + 1` cycles. */
+export const vrc6PulseHz = (period: number, shift = 0) => CPU_HZ / (16 * ((period >> shift) + 1));
+
+/** Hz of the VRC6 sawtooth's period (with `$9003`'s shift, if any): 14 steps of `(period >> shift) + 1` cycles. */
+export const vrc6SawHz = (period: number, shift = 0) => CPU_HZ / (14 * ((period >> shift) + 1));

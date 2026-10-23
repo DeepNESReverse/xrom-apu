@@ -44,8 +44,9 @@ export interface RenderOptions {
    */
   voiceLevels?: readonly number[];
   /**
-   * Expansion chips to emulate (`'FDS'`, `'N163'`). Left out, they are inferred from the writes: one
-   * to `$4040`–`$408A` means an FDS, one to `$F800`/`$4800` an N163.
+   * Expansion chips to emulate (`'FDS'`, `'N163'`, `'VRC6'`). Left out, they are inferred from the
+   * writes: one to `$4040`–`$408A` means an FDS, one to `$F800`/`$4800` an N163, one to
+   * `$9000`–`$9003`/`$A000`–`$A002`/`$B000`–`$B002` a VRC6.
    */
   expansion?: readonly string[];
   /** Skip the output filters. For tests that want the raw mixer. */
@@ -120,12 +121,16 @@ export function renderWrites(
   const { pulse1: p1, pulse2: p2, triangle: tri, noise, dmc } = buffers;
   /*
    * The expansion voices, each in a buffer of its own so a fader reaches it: the FDS at voice 5,
-   * the N163's channels at 6.. — its always-on slot 7 first, then 6, 5… as more are switched on.
+   * the N163's channels at 6.. — its always-on slot 7 first, then 6, 5… as more are switched on —
+   * and the VRC6's pulse 1, pulse 2 and saw at 14, 15, 16.
    */
   const fdsOut = chip.fds ? new Float64Array(BLOCK) : null;
   const n163Out = chip.n163 ? Array.from({ length: 8 }, () => new Float64Array(BLOCK)) : null;
   if (fdsOut) buffers.fds = fdsOut;
   if (n163Out) buffers.n163 = n163Out;
+  const vrc6Out = chip.vrc6 ? Array.from({ length: 3 }, () => new Float64Array(BLOCK)) : null;
+  if (vrc6Out) buffers.vrc6 = vrc6Out;
+  const fVrc6 = [14, 15, 16].map((voice) => (faders ? (faders[voice] ?? 1) : 1));
   const fFds = faders ? (faders[5] ?? 1) : 1;
   const fN163 = Array.from({ length: 8 }, (_, slot) => (faders ? (faders[6 + 7 - slot] ?? 1) : 1));
   const hasClicks = clicks.length > 0;
@@ -163,6 +168,7 @@ export function renderWrites(
       }
       if (fdsOut) mixed += fdsOut[k] * fFds;
       if (n163Out) for (let slot = 0; slot < 8; slot++) mixed += n163Out[slot][k] * fN163[slot];
+      if (vrc6Out) mixed += vrc6Out[0][k] * fVrc6[0] + vrc6Out[1][k] * fVrc6[1] + vrc6Out[2][k] * fVrc6[2];
       // Filtered at the oversampled rate: the low-pass then doubles as the
       // anti-aliasing filter the decimation needs.
       let value = filtered ? filters.step(mixed) : mixed;
@@ -206,9 +212,15 @@ export function renderWrites(
 export function expansionOf(writes: readonly RegisterWrite[]): string[] {
   let fds = false;
   let n163 = false;
+  let vrc6 = false;
   for (const w of writes) {
     if (w.address >= 0x4040 && w.address <= 0x408a) fds = true;
     else if ((w.address >= 0xf800 && w.address <= 0xffff) || (w.address >= 0x4800 && w.address <= 0x4fff)) n163 = true;
+    else if (isVrc6Address(w.address)) vrc6 = true;
   }
-  return [...(fds ? ['FDS'] : []), ...(n163 ? ['N163'] : [])];
+  return [...(fds ? ['FDS'] : []), ...(n163 ? ['N163'] : []), ...(vrc6 ? ['VRC6'] : [])];
 }
+
+/** `$9000`–`$9003`, `$A000`–`$A002`, `$B000`–`$B002`: the VRC6's registers. */
+const isVrc6Address = (address: number) =>
+  (address >= 0x9000 && address <= 0x9003) || (address >= 0xa000 && address <= 0xa002) || (address >= 0xb000 && address <= 0xb002);

@@ -33,11 +33,16 @@ export { mixApu, OutputFilters } from './mixer.js';
 export {
   FdsChip,
   N163Chip,
+  Vrc6Chip,
   fdsHz,
   n163Hz,
+  vrc6PulseHz,
+  vrc6SawHz,
   type FdsSnapshot,
   type N163ChannelSnapshot,
   type N163Snapshot,
+  type Vrc6PulseSnapshot,
+  type Vrc6Snapshot,
 } from './expansion.js';
 export {
   SWEEP_HZ,

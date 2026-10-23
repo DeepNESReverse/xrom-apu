@@ -42,6 +42,11 @@ import { renderWrites, type Click, type RegisterWrite, type RenderOptions } from
  * those `period` is the frequency in hundredths of a hertz (their registers depend on the wave's
  * length and the chip's channel count, which the adapter chooses itself), `volume` is 0..15, and
  * `waveIndex` (the 14th field) points into `ApuInput.waves`: the waveform the note plays.
+ *
+ * 14 and 15 are the VRC6's pulses, 16 its sawtooth. There too `period` is hundredths of a hertz
+ * and `volume` 0..15; on a pulse `duty` is the chip's 0..7 (high for duty + 1 of 16 steps), or 8
+ * for its mode bit — the volume put out flat; on the saw `volume` stands for the accumulator rate
+ * on a 0..15 scale, written as rate = round(volume · 42 / 15) (42 is the loudest clean saw).
  */
 export type PitchedRow = readonly [
   number,
@@ -60,8 +65,8 @@ export type PitchedRow = readonly [
   number?,
 ];
 
-/** Pitched-row channels past the 2A03's: the FDS, then the N163's eight. */
-export const EXPANSION_CHANNELS = { fds: 5, n163: [6, 7, 8, 9, 10, 11, 12, 13] } as const;
+/** Pitched-row channels past the 2A03's: the FDS, the N163's eight, then the VRC6's pulse, pulse, saw. */
+export const EXPANSION_CHANNELS = { fds: 5, n163: [6, 7, 8, 9, 10, 11, 12, 13], vrc6: [14, 15, 16] } as const;
 
 
 /**
@@ -531,7 +536,7 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
 const hzOf = (row: PitchedRow) => row[5] / 100;
 
 /**
- * The expansion channels' notes as writes: what a driver for the FDS or the N163 would write to
+ * The expansion channels' notes as writes: what a driver for the FDS, the VRC6 or the N163 would write to
  * sound them — the waveform when it changes, then the frequency and level, and once a frame the
  * level while it ramps and the frequency while it bends.
  */
@@ -603,6 +608,56 @@ function expansionWrites(
       }
       const next = voices[i + 1];
       if (!next || next.start > voice.end + 1e-9) put(voice.end, 0x4080, 0x80);
+    });
+  }
+
+  // VRC6: two pulses and the saw, each its three registers; the period counts CPU cycles.
+  {
+    let started = false;
+    EXPANSION_CHANNELS.vrc6.forEach((channel, k) => {
+      const voices = voicesOf(input.pitched, ((row: PitchedRow) => row[3] === channel && row[5] > 0) as (row: never) => boolean);
+      if (voices.length === 0) return;
+      if (!started) put(0, 0x9003, 0x00); // running, no frequency shift
+      started = true;
+      const base = 0x9000 + k * 0x1000;
+      const saw = k === 2;
+      const periodOf = (hz: number) =>
+        Math.min(0xfff, Math.max(0, Math.round(CPU_HZ / ((saw ? 14 : 16) * hz)) - 1));
+      voices.forEach((voice, i) => {
+        const row = voice.row as PitchedRow;
+        const level = levelAtOf(row);
+        const control = saw
+          ? (l: number) => Math.min(0x3f, Math.round((l * 42) / 15))
+          : (l: number) => (row[6] >= 8 ? 0x80 : (Math.max(0, row[6]) & 7) << 4) | l;
+        const period = periodOf(hzOf(row));
+        put(voice.start, base, control(level(0)));
+        put(voice.start, base + 1, period & 0xff);
+        put(voice.start, base + 2, 0x80 | (period >> 8));
+        const curve = curveOf(row);
+        const ramps = levelsOf(row) !== null || row[4] !== row[7];
+        if (curve || ramps) {
+          let lastLevel = level(0);
+          let lastPeriod = period;
+          for (const { time, position } of frames(voice.start, voice.end)) {
+            if (ramps) {
+              const now = level(position);
+              if (now !== lastLevel) put(time, base, control(now));
+              lastLevel = now;
+            }
+            if (curve) {
+              const now = periodOf(hzOf(row) * Math.pow(2, bendAt(curve, position) / 12));
+              if (now !== lastPeriod) {
+                put(time, base + 1, now & 0xff);
+                // With E kept set: clearing it would restart the wave.
+                if (now >> 8 !== lastPeriod >> 8) put(time, base + 2, 0x80 | (now >> 8));
+              }
+              lastPeriod = now;
+            }
+          }
+        }
+        const next = voices[i + 1];
+        if (!next || next.start > voice.end + 1e-9) put(voice.end, base + 2, period >> 8);
+      });
     });
   }
 

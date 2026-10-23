@@ -1,5 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { Apu, EXPANSION_CHANNELS, FdsChip, N163Chip, fdsHz, n163Hz, renderNotes, renderWrites, type PitchedRow } from '../src/index.js';
+import {
+  Apu,
+  EXPANSION_CHANNELS,
+  FdsChip,
+  N163Chip,
+  Vrc6Chip,
+  expansionOf,
+  fdsHz,
+  n163Hz,
+  renderNotes,
+  renderWrites,
+  vrc6PulseHz,
+  vrc6SawHz,
+  type PitchedRow,
+} from '../src/index.js';
 
 /** Frequency of a buffer by its rising zero crossings, over the middle of it. */
 function pitchOf(samples: Float32Array, rate: number): number {
@@ -97,6 +111,102 @@ describe('N163', () => {
   });
 });
 
+describe('VRC6', () => {
+  /** Fraction of the samples above the buffer's mean: the duty a pulse plays. */
+  const highFraction = (out: Float64Array) => {
+    const mean = out.reduce((a, b) => a + b, 0) / out.length;
+    return out.filter((v) => v > mean).length / out.length;
+  };
+
+  it('plays a pulse at CPU_HZ / (16 · (period + 1)), with its duty of 16', () => {
+    const period = Math.round(1789772.7272727273 / (16 * 440)) - 1;
+    for (const duty of [0, 3, 7]) {
+      const chip = new Vrc6Chip(96000);
+      chip.write(0x9000, (duty << 4) | 15);
+      chip.write(0x9001, period & 0xff);
+      chip.write(0x9002, 0x80 | (period >> 8));
+      const out = new Float64Array(96000 / 2);
+      chip.render(out.length, [out]);
+      expect(pitchOf(Float32Array.from(out), 96000)).toBeCloseTo(vrc6PulseHz(period), -1);
+      expect(highFraction(out)).toBeCloseTo((duty + 1) / 16, 1);
+    }
+  });
+
+  it('puts the volume out flat in mode, and nothing with E clear', () => {
+    const chip = new Vrc6Chip(48000);
+    chip.write(0xa000, 0x80 | 9);
+    chip.write(0xa001, 0x40);
+    chip.write(0xa002, 0x81);
+    const out = new Float64Array(1000);
+    chip.render(1000, [undefined, out]);
+    expect(new Set(out).size).toBe(1);
+    expect(out[0]).toBeGreaterThan(0);
+    chip.write(0xa002, 0x01);
+    const silent = new Float64Array(1000);
+    chip.render(1000, [undefined, silent]);
+    expect(silent.every((v) => v === 0)).toBe(true);
+  });
+
+  it('plays the saw at CPU_HZ / (14 · (period + 1)), its height from the rate', () => {
+    const period = Math.round(1789772.7272727273 / (14 * 220)) - 1;
+    const peakOf = (rate: number) => {
+      const chip = new Vrc6Chip(96000);
+      chip.write(0xb000, rate);
+      chip.write(0xb001, period & 0xff);
+      chip.write(0xb002, 0x80 | (period >> 8));
+      const out = new Float64Array(96000 / 2);
+      chip.render(out.length, [undefined, undefined, out]);
+      expect(pitchOf(Float32Array.from(out), 96000)).toBeCloseTo(vrc6SawHz(period), -1);
+      return Math.max(...out);
+    };
+    // Six additions of the rate, the top five bits of the accumulator out.
+    expect(peakOf(42) / peakOf(21)).toBeCloseTo(31 / 15, 1);
+  });
+
+  it('shifts every period by $9003, and halts there', () => {
+    const chip = new Vrc6Chip(96000);
+    chip.write(0x9000, 0x7f);
+    chip.write(0x9001, 0xff);
+    chip.write(0x9002, 0x8f); // period $FFF: ~27 Hz
+    chip.write(0x9003, 0x02); // ×16
+    expect(chip.snapshot().shift).toBe(4);
+    const out = new Float64Array(96000 / 2);
+    chip.render(out.length, [out]);
+    expect(pitchOf(Float32Array.from(out), 96000)).toBeCloseTo(vrc6PulseHz(0xfff, 4), -1);
+    chip.write(0x9003, 0x06); // bit 2 wins: ×256
+    expect(chip.snapshot().shift).toBe(8);
+    chip.write(0x9003, 0x01);
+    const held = new Float64Array(1000);
+    chip.render(1000, [held]);
+    expect(new Set(held).size).toBe(1);
+    expect(chip.snapshot().halted).toBe(true);
+  });
+
+  it('is turned on by its writes, and mixes about one and a half 2A03 pulses loud', () => {
+    const writes = [
+      { time: 0, address: 0x9000, value: 0x7f },
+      { time: 0, address: 0x9001, value: 0xfd },
+      { time: 0, address: 0x9002, value: 0x80 },
+    ];
+    expect(expansionOf(writes)).toEqual(['VRC6']);
+    const vrc6 = renderWrites(writes, 0.3, { filters: false });
+    const apu = renderWrites(
+      [
+        { time: 0, address: 0x4015, value: 0x01 },
+        { time: 0, address: 0x4000, value: 0xbf },
+        { time: 0, address: 0x4001, value: 0x08 },
+        { time: 0, address: 0x4002, value: 0xfd },
+        { time: 0, address: 0x4003, value: 0x00 },
+      ],
+      0.3,
+      { filters: false }
+    );
+    expect(vrc6.peak / apu.peak).toBeGreaterThan(1.3);
+    expect(vrc6.peak / apu.peak).toBeLessThan(1.7);
+    expect(new Apu(48000, { expansion: ['VRC6'] }).snapshot().vrc6?.pulse[0].enabled).toBe(false);
+  });
+});
+
 describe('expansion notes', () => {
   const row = (channel: number, midi: number, wave: number): PitchedRow => {
     const hz = 440 * Math.pow(2, (midi - 69) / 12);
@@ -116,6 +226,17 @@ describe('expansion notes', () => {
         { pitched: [...others, row(channel, 69, 0)], drums: [], waves: [SQUARE32], secondsPerTick: 1 / 64, totalTicks: 64 },
         // Only the channel under test: the other one faded out.
         { voiceLevels: Array.from({ length: 14 }, (_, v) => (v === channel ? 1 : 0)) }
+      );
+      expect(pitchOf(r.samples, r.sampleRate)).toBeGreaterThan(430);
+      expect(pitchOf(r.samples, r.sampleRate)).toBeLessThan(450);
+    }
+  });
+
+  it('sound VRC6 notes on its pulses and saw, each at its pitch', () => {
+    for (const channel of EXPANSION_CHANNELS.vrc6) {
+      const r = renderNotes(
+        { pitched: [row(EXPANSION_CHANNELS.vrc6[0], 57, -1), row(channel, 69, -1)], drums: [], secondsPerTick: 1 / 64, totalTicks: 64 },
+        { voiceLevels: Array.from({ length: 17 }, (_, v) => (v === channel ? 1 : 0)) }
       );
       expect(pitchOf(r.samples, r.sampleRate)).toBeGreaterThan(430);
       expect(pitchOf(r.samples, r.sampleRate)).toBeLessThan(450);

@@ -41,7 +41,14 @@ import {
 } from './constants.js';
 import { LONG_CYCLE, LONG_HIGH_BEFORE, LONG_INDEX, LONG_STATES } from './lfsr.js';
 import { decodeSweep, sweepMutes, sweepTarget, type SweepConfig } from './sweep.js';
-import { FdsChip, N163Chip, type FdsSnapshot, type N163Snapshot } from './expansion.js';
+import {
+  FdsChip,
+  N163Chip,
+  Vrc6Chip,
+  type FdsSnapshot,
+  type N163Snapshot,
+  type Vrc6Snapshot,
+} from './expansion.js';
 
 /** The four duty sequences flattened, `duty * 8 + step`. */
 const DUTY_FLAT = Uint8Array.from(DUTY_SEQUENCES.flat());
@@ -156,6 +163,11 @@ export interface ChannelBuffers {
    * units; index 8, if given, takes every slot without a buffer of its own.
    */
   n163?: (Float64Array | undefined)[];
+  /**
+   * The VRC6's channels — pulse 1, pulse 2, saw — in `mixApu` units; index 3, if given, takes every
+   * channel without a buffer of its own.
+   */
+  vrc6?: (Float64Array | undefined)[];
 }
 
 /** Cartridge memory for the DMC: the bytes of `$8000`–`$FFFF`, or a reader for any address. */
@@ -194,6 +206,7 @@ export interface ApuSnapshot {
   /** The expansion chips' state, when the chip has them (`ApuChipOptions.expansion`). */
   fds?: FdsSnapshot;
   n163?: N163Snapshot;
+  vrc6?: Vrc6Snapshot;
   dmc: {
     /** Output level, 0..127. */
     level: number;
@@ -218,7 +231,8 @@ export interface ApuChipOptions {
   memory?: ApuMemory;
   /**
    * Expansion sound on the cartridge: `'FDS'` takes `$4040`–`$408A`, `'N163'` its address port
-   * (`$F800`), data port (`$4800`) and `$E000`. Their output goes to `ChannelBuffers.fds`/`n163`.
+   * (`$F800`), data port (`$4800`) and `$E000`, `'VRC6'` `$9000`–`$9003`, `$A000`–`$A002` and
+   * `$B000`–`$B002`. Their output goes to `ChannelBuffers.fds`/`n163`/`vrc6`.
    */
   expansion?: readonly string[];
 }
@@ -264,6 +278,8 @@ export class Apu {
   readonly fds: FdsChip | null;
   /** Namco's 163, when `expansion` has `'N163'`. */
   readonly n163: N163Chip | null;
+  /** Konami's VRC6, when `expansion` has `'VRC6'`. */
+  readonly vrc6: Vrc6Chip | null;
   private readonly lengthCounter: boolean;
 
   private readonly pulses: [Pulse, Pulse] = [newPulse(true), newPulse(false)];
@@ -328,6 +344,7 @@ export class Apu {
     this.lengthCounter = options.lengthCounter !== false;
     this.fds = options.expansion?.includes('FDS') ? new FdsChip(sampleRate) : null;
     this.n163 = options.expansion?.includes('N163') ? new N163Chip(sampleRate) : null;
+    this.vrc6 = options.expansion?.includes('VRC6') ? new Vrc6Chip(sampleRate) : null;
     this.samplesPerQuarterFrame = sampleRate / QUARTER_FRAME_HZ;
     this.frameCountdown = this.samplesPerQuarterFrame;
     for (const p of this.pulses) this.retunePulse(p);
@@ -350,6 +367,7 @@ export class Apu {
   write(address: number, value: number) {
     if (address > 0x4017) {
       if (this.fds?.write(address, value)) return;
+      if (this.vrc6?.write(address, value)) return;
       this.n163?.write(address, value);
       return;
     }
@@ -531,6 +549,14 @@ export class Apu {
         cleared.add(out);
       }
       this.n163.render(count, buffers.n163, offset);
+    }
+    if (this.vrc6 && buffers.vrc6) {
+      const cleared = new Set<Float64Array>();
+      for (const out of buffers.vrc6) if (out && !cleared.has(out)) {
+        out.fill(0, offset, offset + count);
+        cleared.add(out);
+      }
+      this.vrc6.render(count, buffers.vrc6, offset);
     }
     let done = 0;
     while (done < count) {
@@ -770,6 +796,7 @@ export class Apu {
       },
       ...(this.fds ? { fds: this.fds.snapshot() } : {}),
       ...(this.n163 ? { n163: this.n163.snapshot() } : {}),
+      ...(this.vrc6 ? { vrc6: this.vrc6.snapshot() } : {}),
       dmc: {
         level: this.dmc.level,
         rateIndex: this.dmc.rateIndex,
