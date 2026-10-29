@@ -635,3 +635,31 @@ describe('DMC hit level', () => {
     expect(without.some((w) => w.address === 0x4011)).toBe(false);
   });
 });
+
+describe('notesToWrites — keepPulsePhase', () => {
+  /** Two notes in a row on pulse 2: 453 then 403, the same high byte (Yie Ar Kung-Fu, bar 3). */
+  const twoNotes = (keepPulsePhase: boolean, over: { length?: number } = {}) => ({
+    pitched: [
+      [59, 0, 1, 1, 7, 453, 2, 7, over.length ?? 0, -1],
+      [61, 1, 1, 1, 7, 403, 2, 7, over.length ?? 0, -1],
+    ] as PitchedRow[],
+    drums: [] as DrumRow[],
+    secondsPerTick: 0.1,
+    totalTicks: 2,
+    keepPulsePhase,
+  });
+  const highWrites = (input: ReturnType<typeof twoNotes>) =>
+    notesToWrites(input).filter((w) => w.address === 0x4007);
+
+  it('writes the high byte on every note by default', () => {
+    expect(highWrites(twoNotes(false))).toHaveLength(2);
+  });
+
+  it('writes it only when it changes, the sequencer running on', () => {
+    expect(highWrites(twoNotes(true))).toHaveLength(1);
+  });
+
+  it('still writes it where the length counter has to be reloaded', () => {
+    expect(highWrites(twoNotes(true, { length: 6 }))).toHaveLength(2);
+  });
+});

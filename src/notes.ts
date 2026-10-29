@@ -147,6 +147,16 @@ export interface ApuInput {
    * speeds its opening up this way — whose ticks are not all the same length.
    */
   tempo?: readonly TempoChange[];
+  /**
+   * The pulses' duty sequencers left running from note to note: a note's `$4003`/`$4007` is
+   * written only when its high byte differs from the last one written, as drivers that write the
+   * high byte only on a change do (Konami's Yie Ar Kung-Fu). The write restarts the sequencer, so
+   * by default — every note, as Battletoads' driver writes it — a repeated note against the same
+   * note held on the other pulse lands at whatever phase its start gives, and in opposite phase the
+   * two cancel: the note goes quiet. Only where the write does nothing else: a constant level with
+   * the length counter halted (no envelope to restart, no length to reload).
+   */
+  keepPulsePhase?: boolean;
 }
 
 export interface TempoChange {
@@ -351,6 +361,11 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
   // Pulses.
   for (const channel of [0, 1]) {
     const base = 0x4000 + channel * 4;
+    /**
+     * The high byte last written to `$4003`/`$4007`, for `keepPulsePhase` — or -1 where the next
+     * note must write it anyway: before the first, or after a note whose length counter ran.
+     */
+    let lastHigh = -1;
     const voices: Voice[] = voicesOf(
       input.pitched,
       // Period 0 would be a divide by zero on the chip too; a row with none is
@@ -375,7 +390,10 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
       put(voice.start, base, reg0(level(0)));
       put(voice.start, base + 1, sweep !== undefined && sweep >= 0 ? sweep : 0x08);
       put(voice.start, base + 2, period & 0xff);
-      put(voice.start, base + 3, (bits.load << 3) | ((period >> 8) & 7));
+      const high = (period >> 8) & 7;
+      const restart = !input.keepPulsePhase || !bits.constant || !bits.halt || high !== lastHigh;
+      if (restart) put(voice.start, base + 3, (bits.load << 3) | high);
+      lastHigh = bits.constant && bits.halt ? high : -1;
 
       const curve = bendIndex >= 0 ? (bends[bendIndex] ?? null) : null;
       const ramps = bits.constant && (levelCurve !== null || volume !== volumeEnd);
@@ -396,7 +414,10 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
               put(time, base + 2, now & 0xff);
               // The high byte only when it changes, as drivers do — writing it
               // restarts the sequencer, which is an audible click.
-              if (now >> 8 !== lastPeriod >> 8) put(time, base + 3, (bits.load << 3) | (now >> 8));
+              if (now >> 8 !== lastPeriod >> 8) {
+                put(time, base + 3, (bits.load << 3) | (now >> 8));
+                if (lastHigh >= 0) lastHigh = now >> 8;
+              }
             }
             lastPeriod = now;
           }
