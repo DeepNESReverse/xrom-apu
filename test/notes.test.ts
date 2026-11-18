@@ -680,3 +680,28 @@ describe('notesToWrites — keepPulsePhase', () => {
     expect(highWrites(twoNotes(true, { length: 6 }))).toHaveLength(2);
   });
 });
+
+describe('notesToWrites — the noise short mode', () => {
+  const drum = (row: DrumRow) => ({ pitched: [] as PitchedRow[], drums: [row], secondsPerTick: 0.05, totalTicks: 40 });
+  const mode = (row: DrumRow) =>
+    notesToWrites(drum(row))
+      .filter((w) => w.address === 0x400e)
+      .map((w) => w.value);
+
+  it('writes bit 7 of $400E for a row in short mode', () => {
+    expect(mode([14, 0, 30, 15, 0, 0, -1, -1, 1])).toEqual([0x8e]);
+  });
+
+  it('leaves it clear for an ordinary row, with or without the field', () => {
+    expect(mode([14, 0, 30, 15, 0, 0, -1, -1, 0])).toEqual([0x0e]);
+    expect(mode([14, 0, 30, 15, 0, 0])).toEqual([0x0e]);
+  });
+
+  it('sounds otherwise than the ordinary hiss', () => {
+    const a = renderApu(drum([14, 0, 30, 15, 15, 0, -1, -1, 1]), { oversample: 1, filters: false });
+    const b = renderApu(drum([14, 0, 30, 15, 15, 0, -1, -1, 0]), { oversample: 1, filters: false });
+    let differ = 0;
+    for (let i = 0; i < a.samples.length; i++) if (a.samples[i] !== b.samples[i]) differ++;
+    expect(differ).toBeGreaterThan(a.samples.length / 4);
+  });
+});

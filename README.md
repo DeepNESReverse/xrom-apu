@@ -100,6 +100,11 @@ field, `levelIndex`. A curve is `[position 0..1, level 0..15]` at each change,
 and holds from one point to the next, as a driver writes whole levels a frame at
 a time. Pulse and noise notes take them; `levelAt(curve, position)` reads one.
 
+A noise note can also carry `shortMode` after `levelIndex`: 1 strikes it in the
+short mode, bit 7 of `$400E`, whose 93-step loop gives a metallic, near-pitched
+buzz instead of the hiss — the low beat of The Punisher's boss theme. Left out
+or 0, the note is the ordinary noise.
+
 `notesToWrites` gives you the writes on their own, if you want to see them.
 
 ### Live

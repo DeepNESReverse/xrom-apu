@@ -90,10 +90,12 @@ export type BendCurve = readonly (readonly [number, number])[];
 
 /**
  * `[periodIndex, startTick, durationTicks, volume, volumeEnd, lengthTicks,
- * envelope, levelIndex]` — a noise-channel note. `periodIndex` is the low nibble of `$400E`;
- * `levelIndex` points into `ApuInput.levels`, as a pulse row's does, or is -1/absent.
+ * envelope, levelIndex, shortMode]` — a noise-channel note. `periodIndex` is the low nibble of
+ * `$400E`; `levelIndex` points into `ApuInput.levels`, as a pulse row's does, or is -1/absent;
+ * `shortMode` 1 is bit 7 of `$400E` — the short, metallic 93-step loop (The Punisher's Kingpin
+ * theme beats on it), 0 or absent the ordinary hiss.
  */
-export type DrumRow = readonly [number, number, number, number, number, number, number?, number?];
+export type DrumRow = readonly [number, number, number, number, number, number, number?, number?, number?];
 
 /**
  * `[sampleIndex, startTick, durationTicks, rate, loop, level]` — a sample struck
@@ -508,7 +510,7 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
   {
     const voices: Voice[] = voicesOf(input.drums, (() => true) as (row: never) => boolean);
     voices.forEach((voice, i) => {
-      const [periodIndex, , , volume, volumeEnd, lengthTicks, envelope, levelIndex] = voice.row as DrumRow;
+      const [periodIndex, , , volume, volumeEnd, lengthTicks, envelope, levelIndex, shortMode] = voice.row as DrumRow;
       const bits = controlBits(envelope ?? -1, lengthTicks);
       const reg = (level: number) =>
         (bits.halt ? 0x20 : 0) | (bits.constant ? 0x10 | (level & 0x0f) : bits.low);
@@ -521,7 +523,7 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
           : Math.min(15, Math.max(0, Math.round(volume + (volumeEnd - volume) * at)));
 
       put(voice.start, 0x400c, reg(level(0)));
-      put(voice.start, 0x400e, periodIndex & 0x0f);
+      put(voice.start, 0x400e, (periodIndex & 0x0f) | (shortMode ? 0x80 : 0));
       put(voice.start, 0x400f, bits.load << 3);
 
       if (bits.constant && (levelCurve !== null || volume !== volumeEnd)) {
