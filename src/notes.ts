@@ -24,7 +24,7 @@
  *    same moment.
  */
 
-import { CPU_HZ, DMC_PERIODS, FRAME_HZ, LENGTH_TABLE } from './constants.js';
+import { CPU_HZ, DMC_PERIODS, FRAME_HZ, LENGTH_TABLE, QUARTER_FRAME_HZ } from './constants.js';
 import { renderWrites, type Click, type RegisterWrite, type RenderOptions } from './render.js';
 
 /**
@@ -252,6 +252,11 @@ const lengthIndex = (halfFrames: number) => {
   return index;
 };
 
+/** Half-frames a second: the rate the length counters count at. */
+const LENGTH_HZ = QUARTER_FRAME_HZ / 2;
+/** The triangle's linear counter at its longest, 127 quarter-frames, in half-frames: 0.53 s. */
+const LINEAR_HALF_FRAMES = 127 / 2;
+
 /** The longest load, 254 half-frames (2.1 s) — for a note with no counter that cannot halt it. */
 const LONGEST = 1;
 
@@ -462,11 +467,19 @@ export function notesToWrites(input: ApuInput, lead = 0): RegisterWrite[] {
       // With a counter to honour, the control bit is clear and the linear
       // counter set to its longest (127 quarter-frames, 0.53 s) so the length
       // counter is the one that ends the note; with none, the control bit set
-      // halts both.
-      const load = lengthTicks > 0 ? lengthIndex(lengthTicks) : 0;
+      // halts both. A counter longer than the linear counter can last would be
+      // cut at 0.53 s by it: such a note is held, control bit set, and switched
+      // off in `$4015` where its counter ends.
+      const held = lengthTicks > LINEAR_HALF_FRAMES;
+      const load = lengthTicks > 0 && !held ? lengthIndex(lengthTicks) : 0;
       if (!on) put(voice.start, 0x4015, withSample(enables(true), voice.start));
       on = true;
-      put(voice.start, 0x4008, lengthTicks > 0 ? 0x7f : 0xff);
+      put(voice.start, 0x4008, lengthTicks > 0 && !held ? 0x7f : 0xff);
+      const cut = held ? voice.start + lengthTicks / LENGTH_HZ : Infinity;
+      if (cut < voice.end - 1e-9) {
+        put(cut, 0x4015, withSample(enables(false), cut));
+        on = false;
+      }
       put(voice.start, 0x400a, period & 0xff);
       put(voice.start, 0x400b, (load << 3) | ((period >> 8) & 7));
 

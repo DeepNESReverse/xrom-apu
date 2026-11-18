@@ -178,6 +178,23 @@ describe('renderApu — levels', () => {
     expect(down.peak).toBeGreaterThan(0);
   });
 
+  it('holds a triangle note to its length counter past the linear counter (0.53 s)', () => {
+    // A row 2 s long whose counter stops it at 160 half-frames, 1.33 s. With the control bit clear the
+    // linear counter runs out at 127 quarter-frames, 0.53 s, whatever the length counter says: Battle
+    // Tank's G4 and Castle Excellent's bass went silent half a second in.
+    const one = oneNote({ channel: 2, period: 300, length: 160 });
+    const row = [...one.pitched[0]];
+    row[2] = 2;
+    const input = { ...one, pitched: [row as unknown as PitchedRow], totalTicks: 2 };
+    const out = renderApu(input, { oversample: 1, filters: false, sampleRate: 22050 });
+    const swing = (from: number, to: number) => {
+      const part = out.samples.subarray(Math.floor(from * out.sampleRate), Math.floor(to * out.sampleRate));
+      return Math.max(...part) - Math.min(...part);
+    };
+    expect(swing(0.9, 1.2)).toBeGreaterThan(0.01);
+    expect(swing(1.45, 1.9)).toBeLessThan(1e-6);
+  });
+
   it('mixes non-linearly — two pulses are not twice one', () => {
     const one = mixApu(15, 0, 0, 0);
     const two = mixApu(15, 15, 0, 0);
