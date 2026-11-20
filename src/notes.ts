@@ -26,6 +26,7 @@
 
 import { CPU_HZ, DMC_PERIODS, FRAME_HZ, LENGTH_TABLE, QUARTER_FRAME_HZ } from './constants.js';
 import { renderWrites, type Click, type RegisterWrite, type RenderOptions } from './render.js';
+import { VRC7_RATE } from './vrc7.js';
 
 /**
  * `[midi, startTick, durationTicks, channel, volume, period, duty,
@@ -47,6 +48,14 @@ import { renderWrites, type Click, type RegisterWrite, type RenderOptions } from
  * and `volume` 0..15; on a pulse `duty` is the chip's 0..7 (high for duty + 1 of 16 steps), or 8
  * for its mode bit — the volume put out flat; on the saw `volume` stands for the accumulator rate
  * on a 0..15 scale, written as rate = round(volume · 42 / 15) (42 is the loudest clean saw).
+ *
+ * 17 and 18 are the MMC5's pulses: `period` hundredths of a hertz, `volume` 0..15, `duty` the
+ * 2A03's 0..3. They play at a constant volume, the level written a frame at a time as on the 2A03.
+ *
+ * 20..25 are the VRC7's six FM channels: `period` hundredths of a hertz, `volume` 0..15 (15 the
+ * loudest — the chip's own field counts the other way), `duty` the instrument, 1..15 the chip's own
+ * and 0 the one a driver writes, whose eight bytes (`$00`–`$07`) `waveIndex` points to in
+ * `ApuInput.waves`.
  */
 export type PitchedRow = readonly [
   number,
@@ -65,8 +74,17 @@ export type PitchedRow = readonly [
   number?,
 ];
 
-/** Pitched-row channels past the 2A03's: the FDS, the N163's eight, then the VRC6's pulse, pulse, saw. */
-export const EXPANSION_CHANNELS = { fds: 5, n163: [6, 7, 8, 9, 10, 11, 12, 13], vrc6: [14, 15, 16] } as const;
+/**
+ * Pitched-row channels past the 2A03's: the FDS, the N163's eight, the VRC6's pulse, pulse, saw, and
+ * the MMC5's two pulses (19 is its PCM's fader, not a pitched channel).
+ */
+export const EXPANSION_CHANNELS = {
+  fds: 5,
+  n163: [6, 7, 8, 9, 10, 11, 12, 13],
+  vrc6: [14, 15, 16],
+  mmc5: [17, 18],
+  vrc7: [20, 21, 22, 23, 24, 25],
+} as const;
 
 
 /**
@@ -693,6 +711,113 @@ function expansionWrites(
         }
         const next = voices[i + 1];
         if (!next || next.start > voice.end + 1e-9) put(voice.end, base + 2, period >> 8);
+      });
+    });
+  }
+
+  // MMC5: two pulses as the 2A03's, at a constant volume and halted length counter; no sweep.
+  {
+    let started = false;
+    EXPANSION_CHANNELS.mmc5.forEach((channel, k) => {
+      const voices = voicesOf(input.pitched, ((row: PitchedRow) => row[3] === channel && row[5] > 0) as (row: never) => boolean);
+      if (voices.length === 0) return;
+      if (!started) put(0, 0x5015, 0x03);
+      started = true;
+      const base = 0x5000 + k * 4;
+      const periodOf = (hz: number) => Math.min(0x7ff, Math.max(0, Math.round(CPU_HZ / (16 * hz)) - 1));
+      voices.forEach((voice, i) => {
+        const row = voice.row as PitchedRow;
+        const level = levelAtOf(row);
+        const control = (l: number) => ((Math.max(0, row[6]) & 3) << 6) | 0x30 | l;
+        const period = periodOf(hzOf(row));
+        put(voice.start, base, control(level(0)));
+        put(voice.start, base + 2, period & 0xff);
+        put(voice.start, base + 3, 0xf8 | (period >> 8));
+        const curve = curveOf(row);
+        const ramps = levelsOf(row) !== null || row[4] !== row[7];
+        if (curve || ramps) {
+          let lastLevel = level(0);
+          let lastPeriod = period;
+          for (const { time, position } of frames(voice.start, voice.end)) {
+            if (ramps) {
+              const now = level(position);
+              if (now !== lastLevel) put(time, base, control(now));
+              lastLevel = now;
+            }
+            if (curve) {
+              const now = periodOf(hzOf(row) * Math.pow(2, bendAt(curve, position) / 12));
+              if (now !== lastPeriod) {
+                put(time, base + 2, now & 0xff);
+                // The high byte restarts the duty step, as on the 2A03: only when it changes.
+                if (now >> 8 !== lastPeriod >> 8) put(time, base + 3, 0xf8 | (now >> 8));
+              }
+              lastPeriod = now;
+            }
+          }
+        }
+        const next = voices[i + 1];
+        if (!next || next.start > voice.end + 1e-9) put(voice.end, base, ((Math.max(0, row[6]) & 3) << 6) | 0x30);
+      });
+    });
+  }
+
+  // VRC7: each channel's frequency, octave and key; its instrument and volume. A register is two
+  // writes, the address to $9010 and the value to $9030.
+  {
+    const reg = (time: number, register: number, value: number) => {
+      put(time, 0x9010, register);
+      put(time, 0x9030, value & 0xff);
+    };
+    let custom = '';
+    EXPANSION_CHANNELS.vrc7.forEach((channel, k) => {
+      const voices = voicesOf(input.pitched, ((row: PitchedRow) => row[3] === channel && row[5] > 0) as (row: never) => boolean);
+      voices.forEach((voice, i) => {
+        const row = voice.row as PitchedRow;
+        const level = levelAtOf(row);
+        const instrument = Math.max(0, Math.min(15, row[6] | 0));
+        const control = (l: number) => (instrument << 4) | (15 - Math.max(0, Math.min(15, l)));
+        const baseHz = hzOf(row);
+        // The lowest octave that holds the pitch in nine bits: the finest frequency steps.
+        const block = Math.max(0, Math.min(7, Math.ceil(19 - Math.log2((511 * VRC7_RATE) / baseHz))));
+        const fnumOf = (hz: number) => Math.min(511, Math.max(0, Math.round((hz * Math.pow(2, 19 - block)) / VRC7_RATE)));
+        const keyed = (fnum: number) => 0x10 | (block << 1) | (fnum >> 8);
+        if (instrument === 0) {
+          const patch = waves[row[13] ?? -1];
+          const key = patch ? patch.slice(0, 8).join(',') : '';
+          if (patch && key !== custom) {
+            patch.slice(0, 8).forEach((v, r) => reg(voice.start, r, v));
+            custom = key;
+          }
+        }
+        const fnum = fnumOf(baseHz);
+        // Keyed off first: the chip strikes on the key bit's rise, so a note after a note restarts.
+        reg(voice.start, 0x20 + k, (block << 1) | (fnum >> 8));
+        reg(voice.start, 0x30 + k, control(level(0)));
+        reg(voice.start, 0x10 + k, fnum & 0xff);
+        reg(voice.start, 0x20 + k, keyed(fnum));
+        const curve = curveOf(row);
+        const ramps = levelsOf(row) !== null || row[4] !== row[7];
+        if (curve || ramps) {
+          let lastLevel = level(0);
+          let lastFnum = fnum;
+          for (const { time, position } of frames(voice.start, voice.end)) {
+            if (ramps) {
+              const now = level(position);
+              if (now !== lastLevel) reg(time, 0x30 + k, control(now));
+              lastLevel = now;
+            }
+            if (curve) {
+              const now = fnumOf(baseHz * Math.pow(2, bendAt(curve, position) / 12));
+              if (now !== lastFnum) {
+                reg(time, 0x10 + k, now & 0xff);
+                if (now >> 8 !== lastFnum >> 8) reg(time, 0x20 + k, keyed(now));
+              }
+              lastFnum = now;
+            }
+          }
+        }
+        const next = voices[i + 1];
+        if (!next || next.start > voice.end + 1e-9) reg(voice.end, 0x20 + k, (block << 1) | (fnum >> 8));
       });
     });
   }

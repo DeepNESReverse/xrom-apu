@@ -5,7 +5,11 @@ import {
   FdsChip,
   N163Chip,
   Vrc6Chip,
+  Mmc5Chip,
   expansionOf,
+  mmc5PulseHz,
+  Vrc7Chip,
+  vrc7Hz,
   fdsHz,
   n163Hz,
   renderNotes,
@@ -207,6 +211,137 @@ describe('VRC6', () => {
   });
 });
 
+describe('MMC5', () => {
+  const highFraction = (out: Float64Array) => {
+    const mean = out.reduce((a, b) => a + b, 0) / out.length;
+    return out.filter((v) => v > mean).length / out.length;
+  };
+
+  it('plays a pulse at CPU_HZ / (16 · (period + 1)), with the 2A03\'s duties', () => {
+    const period = Math.round(1789772.7272727273 / (16 * 440)) - 1;
+    for (const [duty, fraction] of [[0, 1 / 8], [1, 2 / 8], [2, 4 / 8]] as const) {
+      const chip = new Mmc5Chip(96000);
+      chip.write(0x5015, 0x01);
+      chip.write(0x5000, (duty << 6) | 0x30 | 15);
+      chip.write(0x5002, period & 0xff);
+      chip.write(0x5003, 0xf8 | (period >> 8));
+      const out = new Float64Array(96000 / 2);
+      chip.render(out.length, [out]);
+      expect(pitchOf(Float32Array.from(out), 96000)).toBeCloseTo(mmc5PulseHz(period), -1);
+      expect(highFraction(out)).toBeCloseTo(fraction, 1);
+    }
+  });
+
+  it('counts its length at 240 Hz, and $5015 shows it running', () => {
+    const chip = new Mmc5Chip(48000);
+    chip.write(0x5015, 0x02);
+    chip.write(0x5004, 0x1f); // constant volume, length counting
+    chip.write(0x5006, 0x80);
+    chip.write(0x5007, 0x18); // length index 3: 2 steps
+    expect(chip.status()).toBe(2);
+    chip.render(48000 / 100, [undefined, new Float64Array(480)]); // 10 ms: past two quarter frames
+    expect(chip.status()).toBe(0);
+    expect(chip.snapshot().pulse[1].volume).toBe(0);
+  });
+
+  it('is silent until $5015 enables it, and runs its envelope at 240 Hz', () => {
+    const chip = new Mmc5Chip(48000);
+    chip.write(0x5000, 0x23); // envelope, period 3, looping (halt)
+    chip.write(0x5002, 0x80);
+    chip.write(0x5003, 0x00);
+    expect(chip.snapshot().pulse[0].enabled).toBe(false);
+    chip.write(0x5015, 0x01);
+    chip.write(0x5003, 0x00);
+    chip.render(1, [new Float64Array(1)]);
+    // 1 s at 240 Hz, a step every 4 quarter frames: the envelope has looped and is still going.
+    chip.render(48000, [new Float64Array(48000)]);
+    expect(chip.snapshot().pulse[0].length).toBeGreaterThan(0);
+    expect(chip.snapshot().pulse[0].volume).toBeGreaterThanOrEqual(0);
+  });
+
+  it('is turned on by its writes, and mixes as loud as a 2A03 pulse', () => {
+    const writes = [
+      { time: 0, address: 0x5015, value: 0x01 },
+      { time: 0, address: 0x5000, value: 0xbf },
+      { time: 0, address: 0x5002, value: 0xfd },
+      { time: 0, address: 0x5003, value: 0x00 },
+    ];
+    expect(expansionOf(writes)).toEqual(['MMC5']);
+    const mmc5 = renderWrites(writes, 0.3, { filters: false });
+    const apu = renderWrites(
+      [
+        { time: 0, address: 0x4015, value: 0x01 },
+        { time: 0, address: 0x4000, value: 0xbf },
+        { time: 0, address: 0x4001, value: 0x08 },
+        { time: 0, address: 0x4002, value: 0xfd },
+        { time: 0, address: 0x4003, value: 0x00 },
+      ],
+      0.3,
+      { filters: false }
+    );
+    expect(mmc5.peak / apu.peak).toBeGreaterThan(0.9);
+    expect(mmc5.peak / apu.peak).toBeLessThan(1.1);
+    expect(new Apu(48000, { expansion: ['MMC5'] }).snapshot().mmc5?.pulse[0].enabled).toBe(false);
+  });
+});
+
+describe('VRC7', () => {
+  /** A plain sine: the modulator silent (output level 63), carrier ×1, instant attack, held. */
+  const SINE_PATCH = [0x20, 0x21, 0x3f, 0x00, 0xf0, 0xf0, 0x00, 0x0f];
+  const write = (chip: Vrc7Chip, register: number, value: number) => {
+    chip.write(0x9010, register);
+    chip.write(0x9030, value);
+  };
+  const keyOn = (chip: Vrc7Chip, channel: number, fnum: number, block: number, instrument: number, volume = 0) => {
+    write(chip, 0x30 + channel, (instrument << 4) | volume);
+    write(chip, 0x10 + channel, fnum & 0xff);
+    write(chip, 0x20 + channel, 0x10 | (block << 1) | (fnum >> 8));
+  };
+
+  it('plays a channel at 49716 · f / 2^(19 − octave)', () => {
+    const chip = new Vrc7Chip(96000);
+    SINE_PATCH.forEach((v, r) => write(chip, r, v));
+    const fnum = Math.round((440 * Math.pow(2, 19 - 4)) / 49715.9);
+    keyOn(chip, 2, fnum, 4, 0);
+    const out = new Float64Array(96000 / 2);
+    chip.render(out.length, [undefined, undefined, out]);
+    expect(pitchOf(Float32Array.from(out), 96000)).toBeCloseTo(vrc7Hz(fnum, 4), -1);
+    expect(vrc7Hz(fnum, 4)).toBeCloseTo(440, -1);
+  });
+
+  it('is louder at volume 0 than at 15, and fades after key-off', () => {
+    const peak = (volume: number) => {
+      const chip = new Vrc7Chip(48000);
+      SINE_PATCH.forEach((v, r) => write(chip, r, v));
+      keyOn(chip, 0, 290, 4, 0, volume);
+      const out = new Float64Array(4800);
+      chip.render(out.length, [out]);
+      return Math.max(...out.map(Math.abs));
+    };
+    // 15 steps of 3 dB: 45 dB apart.
+    expect(20 * Math.log10(peak(0) / peak(15))).toBeCloseTo(45, -1);
+    const chip = new Vrc7Chip(48000);
+    keyOn(chip, 0, 290, 4, 3); // Wurly: a real release
+    chip.render(4800, [new Float64Array(4800)]);
+    write(chip, 0x20, 0x08);
+    expect(chip.snapshot().channels[0].key).toBe(false);
+    chip.render(48000 * 3, [new Float64Array(48000 * 3)]);
+    expect(chip.snapshot().channels[0].sounding).toBe(false);
+  });
+
+  it('sounds each built-in instrument, and is turned on by its writes', () => {
+    for (let instrument = 1; instrument <= 15; instrument++) {
+      const chip = new Vrc7Chip(48000);
+      keyOn(chip, 1, 290, 4, instrument);
+      const out = new Float64Array(9600);
+      chip.render(out.length, [undefined, out]);
+      expect(Math.max(...out.map(Math.abs))).toBeGreaterThan(0.005);
+    }
+    expect(expansionOf([{ time: 0, address: 0x9010, value: 0x30 }, { time: 0, address: 0x9030, value: 0x30 }])).toEqual(['VRC7']);
+    expect(new Apu(48000, { expansion: ['VRC7'] }).snapshot().vrc7?.channels).toHaveLength(6);
+  });
+});
+
 describe('expansion notes', () => {
   const row = (channel: number, midi: number, wave: number): PitchedRow => {
     const hz = 440 * Math.pow(2, (midi - 69) / 12);
@@ -237,6 +372,29 @@ describe('expansion notes', () => {
       const r = renderNotes(
         { pitched: [row(EXPANSION_CHANNELS.vrc6[0], 57, -1), row(channel, 69, -1)], drums: [], secondsPerTick: 1 / 64, totalTicks: 64 },
         { voiceLevels: Array.from({ length: 17 }, (_, v) => (v === channel ? 1 : 0)) }
+      );
+      expect(pitchOf(r.samples, r.sampleRate)).toBeGreaterThan(430);
+      expect(pitchOf(r.samples, r.sampleRate)).toBeLessThan(450);
+    }
+  });
+
+  it('sound MMC5 notes on its two pulses, each at its pitch', () => {
+    for (const channel of EXPANSION_CHANNELS.mmc5) {
+      const r = renderNotes(
+        { pitched: [row(EXPANSION_CHANNELS.mmc5[0], 57, -1), row(channel, 69, -1)], drums: [], secondsPerTick: 1 / 64, totalTicks: 64 },
+        { voiceLevels: Array.from({ length: 20 }, (_, v) => (v === channel ? 1 : 0)) }
+      );
+      expect(pitchOf(r.samples, r.sampleRate)).toBeGreaterThan(430);
+      expect(pitchOf(r.samples, r.sampleRate)).toBeLessThan(450);
+    }
+  });
+
+  it('sound VRC7 notes on each of its six channels at their pitch, with the driver\'s own instrument', () => {
+    const SINE_PATCH = [0x20, 0x21, 0x3f, 0x00, 0xf0, 0xf0, 0x00, 0x0f];
+    for (const channel of EXPANSION_CHANNELS.vrc7) {
+      const r = renderNotes(
+        { pitched: [row(channel, 69, 0)], drums: [], waves: [SINE_PATCH], secondsPerTick: 1 / 64, totalTicks: 64 },
+        { voiceLevels: Array.from({ length: 26 }, (_, v) => (v === channel ? 1 : 0)) }
       );
       expect(pitchOf(r.samples, r.sampleRate)).toBeGreaterThan(430);
       expect(pitchOf(r.samples, r.sampleRate)).toBeLessThan(450);

@@ -34,7 +34,9 @@ export {
   FdsChip,
   N163Chip,
   Vrc6Chip,
+  Mmc5Chip,
   fdsHz,
+  mmc5PulseHz,
   n163Hz,
   vrc6PulseHz,
   vrc6SawHz,
@@ -43,7 +45,17 @@ export {
   type N163Snapshot,
   type Vrc6PulseSnapshot,
   type Vrc6Snapshot,
+  type Mmc5PulseSnapshot,
+  type Mmc5Snapshot,
 } from './expansion.js';
+export {
+  Vrc7Chip,
+  VRC7_INSTRUMENTS,
+  VRC7_RATE,
+  vrc7Hz,
+  type Vrc7ChannelSnapshot,
+  type Vrc7Snapshot,
+} from './vrc7.js';
 export {
   SWEEP_HZ,
   decodeSweep,

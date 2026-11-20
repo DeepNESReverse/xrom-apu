@@ -15,13 +15,16 @@ they come out. **Try it live in the browser:
 [xrom.dev/utils/apu](https://xrom.dev/utils/apu).**
 
 - All five channels: two pulses, the triangle, noise and the DMC (samples).
-- Three Famicom expansion chips, when a game has them: the Disk System's
+- Five Famicom expansion chips, when a game has them: the Disk System's
   wavetable voice (FDS, `$4040`–`$408A`), Namco's 163 (up to eight wavetable
-  channels, through its ports at `$F800`/`$4800`) and Konami's VRC6 (two pulses
-  with eight duties and a sawtooth, `$9000`–`$B002`). `renderWrites` turns them
-  on when the writes talk to them; `renderNotes` plays notes on them, the
-  wavetables from `waves` (`EXPANSION_CHANNELS`: FDS is channel 5, the N163's
-  6–13, the VRC6's 14–16).
+  channels, through its ports at `$F800`/`$4800`), Konami's VRC6 (two pulses
+  with eight duties and a sawtooth, `$9000`–`$B002`), Nintendo's MMC5 (two more
+  2A03-style pulses and an 8-bit PCM, `$5000`–`$5015`) and Konami's VRC7 (six
+  channels of two-operator FM, a cut-down YM2413, through `$9010`/`$9030`, with
+  its fifteen built-in instruments). `renderWrites` turns them on when the writes
+  talk to them; `renderNotes` plays notes on them, the wavetables and the VRC7's
+  own instrument from `waves` (`EXPANSION_CHANNELS`: FDS is channel 5, the
+  N163's 6–13, the VRC6's 14–16, the MMC5's 17–18, the VRC7's 20–25).
 - No dependencies, ~6 KB gzipped, runs anywhere JavaScript does (browser, worker, Node).
 - Pure and deterministic: the same writes always give the same samples, so it
   can be tested by measuring rather than by ear.
