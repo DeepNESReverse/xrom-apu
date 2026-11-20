@@ -17,7 +17,7 @@
  * mixes it (`VRC6_STEP`).
  */
 
-import { CPU_HZ } from './constants.js';
+import { CPU_HZ, DUTY_SEQUENCES, LENGTH_TABLE, QUARTER_FRAME_HZ } from './constants.js';
 
 /** Full-scale output of the FDS (wave 63 × gain 32 at master volume 1), in `mixApu` units. */
 const FDS_FULL = 0.25;
@@ -584,6 +584,238 @@ export class Vrc6Chip {
     };
   }
 }
+
+/** One of the MMC5's two pulses, `$5000`–`$5003` or `$5004`–`$5007`. */
+export interface Mmc5PulseSnapshot {
+  /** 11-bit period; Hz = CPU_HZ / (16 · (period + 1)), as a 2A03 pulse — see `mmc5PulseHz`. */
+  period: number;
+  /** The level it puts out now: the constant volume or the envelope's, 0..15. */
+  volume: number;
+  /** 0..3, the 2A03's duties. */
+  duty: number;
+  /** `$5000` bit 4: the volume as written, not the envelope's. */
+  constant: boolean;
+  /** `$5000` bit 5: the length counter halted, the envelope looping. */
+  halt: boolean;
+  /** The length counter, counting at 240 Hz. */
+  length: number;
+  /** Enabled in `$5015`. */
+  enabled: boolean;
+}
+
+export interface Mmc5Snapshot {
+  pulse: [Mmc5PulseSnapshot, Mmc5PulseSnapshot];
+  /** The PCM channel's 8-bit level, `$5011`. */
+  pcm: number;
+}
+
+interface Mmc5Pulse {
+  duty: number;
+  halt: boolean;
+  constant: boolean;
+  volume: number;
+  period: number;
+  length: number;
+  enabled: boolean;
+  envelopeStart: boolean;
+  envelopeDivider: number;
+  envelopeDecay: number;
+  /** CPU cycles until the next of the eight duty steps, fractional. */
+  timer: number;
+  step: number;
+}
+
+/**
+ * One step of an MMC5 pulse (0..15), in `mixApu` units: the 2A03's own pulse at volume 15 over 15,
+ * so an MMC5 pulse plays as loud as a console pulse, as NSFPlay and Mesen2 mix it. Linear, unlike the
+ * 2A03's pair, so each pulse can have a fader of its own.
+ */
+const MMC5_STEP = 95.88 / (8128 / 15 + 100) / 15;
+/** One step of the 8-bit PCM: the DMC's 7-bit level at its linear slope, so 255 is about DMC 127. */
+const MMC5_PCM_STEP = 0.00335 / 2;
+
+/**
+ * Nintendo's MMC5: two pulses like the 2A03's — the same duties, envelope and length counter, no
+ * sweep — and an 8-bit PCM register, beside the 2A03 (Just Breed, Shin 4-nin Uchi Mahjong, Metal
+ * Slader Glory). The chip has no frame counter of its own: envelope and length both step at the
+ * quarter-frame rate, 240 Hz, whatever `$4017` says. A pulse with no sweep is never muted by a low
+ * period, so a period under 8 still sounds, as on the cartridge.
+ *
+ * Output is the average over each sample of the levels put out, as the VRC6's.
+ */
+export class Mmc5Chip {
+  private readonly cyclesPerSample: number;
+  private readonly cyclesPerQuarter = CPU_HZ / QUARTER_FRAME_HZ;
+  private quarterTimer = CPU_HZ / QUARTER_FRAME_HZ;
+  private readonly pulses: [Mmc5Pulse, Mmc5Pulse] = [Mmc5Chip.newPulse(), Mmc5Chip.newPulse()];
+  private pcm = 0;
+  private pcmRead = false;
+
+  private static newPulse(): Mmc5Pulse {
+    return {
+      duty: 0,
+      halt: false,
+      constant: false,
+      volume: 0,
+      period: 0,
+      length: 0,
+      enabled: false,
+      envelopeStart: false,
+      envelopeDivider: 0,
+      envelopeDecay: 0,
+      timer: 1,
+      step: 0,
+    };
+  }
+
+  constructor(sampleRate: number) {
+    this.cyclesPerSample = CPU_HZ / sampleRate;
+  }
+
+  /** A write to `$5000`–`$5015`. Returns false for any other address. */
+  write(address: number, value: number): boolean {
+    const v = value & 0xff;
+    if (address >= 0x5000 && address <= 0x5007) {
+      const p = this.pulses[address >> 2 & 1];
+      switch (address & 3) {
+        case 0:
+          p.duty = v >> 6;
+          p.halt = (v & 0x20) !== 0;
+          p.constant = (v & 0x10) !== 0;
+          p.volume = v & 0x0f;
+          break;
+        case 1:
+          // The sweep register: there is no sweep unit.
+          break;
+        case 2:
+          p.period = (p.period & 0x700) | v;
+          break;
+        case 3:
+          p.period = (p.period & 0x0ff) | ((v & 7) << 8);
+          if (p.enabled) p.length = LENGTH_TABLE[v >> 3];
+          p.step = 0;
+          p.envelopeStart = true;
+          break;
+      }
+      return true;
+    }
+    if (address === 0x5010) {
+      this.pcmRead = (v & 1) !== 0;
+      return true;
+    }
+    if (address === 0x5011) {
+      // Write mode only; a 0 is ignored, as the chip ignores it.
+      if (!this.pcmRead && v !== 0) this.pcm = v;
+      return true;
+    }
+    if (address === 0x5015) {
+      this.pulses.forEach((p, k) => {
+        p.enabled = ((v >> k) & 1) !== 0;
+        if (!p.enabled) p.length = 0;
+      });
+      return true;
+    }
+    return false;
+  }
+
+  /** `$5015` as the driver reads it: bit 0/1 set while that pulse's length counter runs. */
+  status(): number {
+    return (this.pulses[0].length > 0 ? 1 : 0) | (this.pulses[1].length > 0 ? 2 : 0);
+  }
+
+  private static level(p: Mmc5Pulse): number {
+    return p.constant ? p.volume : p.envelopeDecay;
+  }
+
+  /** The envelope and length counter, one quarter frame on. */
+  private quarter() {
+    for (const p of this.pulses) {
+      if (p.envelopeStart) {
+        p.envelopeStart = false;
+        p.envelopeDecay = 15;
+        p.envelopeDivider = p.volume;
+      } else if (p.envelopeDivider > 0) p.envelopeDivider--;
+      else {
+        p.envelopeDivider = p.volume;
+        if (p.envelopeDecay > 0) p.envelopeDecay--;
+        else if (p.halt) p.envelopeDecay = 15;
+      }
+      if (!p.halt && p.length > 0) p.length--;
+    }
+  }
+
+  /**
+   * Advance `count` samples, ADDING each channel's output to `outs[0]` (pulse 1), `outs[1]` (pulse
+   * 2) and `outs[2]` (PCM) — or, for a channel without a buffer of its own, to `outs[3]` if given —
+   * from `offset`.
+   */
+  render(count: number, outs: readonly (Float64Array | undefined)[], offset = 0) {
+    const cps = this.cyclesPerSample;
+    const scale = MMC5_STEP / cps;
+    const pcmOut = outs[2] ?? outs[3];
+    for (let k = 0; k < count; k++) {
+      // The quarter-frame clock may fall inside the sample: the levels change there.
+      let left = cps;
+      const sums = [0, 0];
+      while (left > 0) {
+        const span = Math.min(left, this.quarterTimer);
+        for (let c = 0; c < 2; c++) {
+          const p = this.pulses[c];
+          const reload = 2 * (p.period + 1);
+          const level = p.enabled && p.length > 0 ? Mmc5Chip.level(p) : 0;
+          if (level === 0) {
+            // The sequencer runs on all the same.
+            if (span >= p.timer) {
+              const steps = 1 + Math.floor((span - p.timer) / reload);
+              p.step = (p.step + steps) & 7;
+              p.timer = reload - ((span - p.timer) % reload);
+            } else p.timer -= span;
+            continue;
+          }
+          const duty = DUTY_SEQUENCES[p.duty];
+          let rest = span;
+          let sum = 0;
+          while (rest >= p.timer) {
+            sum += duty[p.step] * p.timer;
+            rest -= p.timer;
+            p.step = (p.step + 1) & 7;
+            p.timer = reload;
+          }
+          sum += duty[p.step] * rest;
+          p.timer -= rest;
+          sums[c] += sum * level;
+        }
+        left -= span;
+        this.quarterTimer -= span;
+        if (this.quarterTimer <= 1e-9) {
+          this.quarter();
+          this.quarterTimer += this.cyclesPerQuarter;
+        }
+      }
+      for (let c = 0; c < 2; c++) {
+        const out = outs[c] ?? outs[3];
+        if (out && sums[c] !== 0) out[offset + k] += sums[c] * scale;
+      }
+      if (pcmOut && this.pcm !== 0) pcmOut[offset + k] += this.pcm * MMC5_PCM_STEP;
+    }
+  }
+
+  snapshot(): Mmc5Snapshot {
+    const pulse = (p: Mmc5Pulse): Mmc5PulseSnapshot => ({
+      period: p.period,
+      volume: p.enabled && p.length > 0 ? Mmc5Chip.level(p) : 0,
+      duty: p.duty,
+      constant: p.constant,
+      halt: p.halt,
+      length: p.length,
+      enabled: p.enabled,
+    });
+    return { pulse: [pulse(this.pulses[0]), pulse(this.pulses[1])], pcm: this.pcm };
+  }
+}
+
+/** Hz of an MMC5 pulse period: eight duty steps of `2 · (period + 1)` CPU cycles, as a 2A03 pulse. */
+export const mmc5PulseHz = (period: number) => CPU_HZ / (16 * (period + 1));
 
 /** Hz of an FDS frequency register value. */
 export const fdsHz = (frequency: number) => (CPU_HZ * frequency) / 4194304;
